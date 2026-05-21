@@ -1,6 +1,5 @@
 [Unit]
-Description=Insect Detect Startup Service
-Documentation=https://maxsitt.github.io/insect-detect-docs/
+Description=InSpectAI-Cam Startup Service
 Wants=network-online.target
 After=network.target network-online.target NetworkManager.service
 
@@ -10,7 +9,7 @@ Type=oneshot
 # actual username and home directory when installing via install.sh or update.sh
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/insect-detect
+WorkingDirectory=/home/pi/inspectai-cam
 ExecStart=/home/pi/.local/bin/uv run startup
 Environment=HOME=/home/pi
 RemainAfterExit=yes
@@ -18,7 +17,7 @@ TimeoutStartSec=600
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=insect-detect-startup
+SyslogIdentifier=inspectai-cam-startup
 
 [Install]
 WantedBy=multi-user.target
