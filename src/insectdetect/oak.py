@@ -12,12 +12,13 @@ Functions:
 """
 
 import logging
+import math
 from datetime import timedelta
 from typing import cast
 
 import depthai as dai
 
-from insectdetect.config import AppConfig
+from insectdetect.config import AppConfig, get_field_constraints
 from insectdetect.constants import MODELS_PATH, RESOLUTION_PRESETS, SENSOR_RES, SENSOR_ROI
 
 # Initialize logger for this module
@@ -46,6 +47,61 @@ def convert_cm_lens_position(distance_cm: int) -> int:
         return CM_LENS_POSITIONS[distance_cm]
     closest_cm = min(CM_KEYS, key=lambda k: abs(k - distance_cm))
     return CM_LENS_POSITIONS[closest_cm]
+
+
+def _build_zoom_table(
+    base_w: int,
+    base_h: int,
+    zoom_min: float = 1.0,
+    zoom_max: float = 3.0,
+    zoom_step: float = 0.1,
+) -> dict[float, tuple[int, int]]:
+    """Build a lookup table mapping zoom factors to aligned output pixel dimensions.
+
+    Width is aligned to multiples of 32, as required by the VideoEncoder node.
+    Height is aligned to multiples of the GCD of the base dimensions clamped to [2, 8],
+    which ensures consistent aspect ratios across zoom steps. For near-square presets
+    (aspect ratio within 2% of 1:1), height is additionally clamped to never exceed width,
+    preventing width < height entries that would occur when the finer height alignment
+    snaps height to a larger value than the coarser width alignment.
+
+    Args:
+        base_w:    Input frame width in pixels.
+        base_h:    Input frame height in pixels.
+        zoom_min:  Minimum zoom factor (default: 1.0).
+        zoom_max:  Maximum zoom factor (default: 3.0).
+        zoom_step: Zoom factor step size (default: 0.1).
+
+    Returns:
+        Dict mapping each zoom factor (rounded to 1 decimal) to (zoomed_w, zoomed_h).
+    """
+    align_w = 32
+    align_h = max(2, min(8, math.gcd(base_w, base_h)))
+    is_square = abs(base_w / base_h - 1.0) < 0.02
+    zoom_table: dict[float, tuple[int, int]] = {zoom_min: (base_w, base_h)}
+    n_steps = round((zoom_max - zoom_min) / zoom_step)
+    for i in range(1, n_steps + 1):
+        zoom = round(zoom_min + i * zoom_step, 1)
+        zoomed_w = int(base_w / zoom) // align_w * align_w
+        zoomed_h = int(base_h / zoom) // align_h * align_h
+        if is_square and zoomed_h > zoomed_w:
+            zoomed_h = zoomed_w
+        zoom_table[zoom] = (zoomed_w, zoomed_h)
+    return zoom_table
+
+
+# Mapping of zoom factors to aligned output pixel dimensions for captured images and web app stream
+_zoom_constraints = get_field_constraints(AppConfig, "camera", "zoom", "factor")
+_ZOOM_MIN: float = float(_zoom_constraints["min"] or 1.0)
+_ZOOM_MAX: float = float(_zoom_constraints["max"] or 3.0)
+_ZOOM_STEP: float = float(_zoom_constraints["multiple_of"] or 0.1)
+ZOOM_SIZES: dict[str, dict[str, dict[float, tuple[int, int]]]] = {
+    preset: {
+        "image": _build_zoom_table(image_w, image_h, _ZOOM_MIN, _ZOOM_MAX, _ZOOM_STEP),
+        "stream": _build_zoom_table(stream_w, stream_h, _ZOOM_MIN, _ZOOM_MAX, _ZOOM_STEP)
+    }
+    for preset, (image_w, image_h, stream_w, stream_h) in RESOLUTION_PRESETS.items()
+}
 
 
 def deletterbox_bbox(
