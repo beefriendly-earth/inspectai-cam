@@ -1,12 +1,11 @@
 """Run configured startup sequence at boot (requires enabled systemd service).
 
-Source:   https://github.com/maxsitt/insect-detect
+Source:   https://github.com/beefriendly-earth/inspectai-cam
 License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 Author:   Maximilian Sittinger (https://github.com/maxsitt)
-Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 Usage:
-    Enable the systemd service 'insect-detect-startup.service'
+    Enable the systemd service 'inspectai-cam-startup.service'
     to run this script automatically after boot.
 
 Startup sequence (optional steps configured in active config file):
