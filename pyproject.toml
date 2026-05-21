@@ -1,7 +1,7 @@
 [project]
-name = "insect-detect"
-version = "2.0.0"
-description = "Software for automated insect monitoring with the Insect Detect camera trap."
+name = "inspectai-cam"
+version = "1.0.0"
+description = "Adapted software for automated insect monitoring with the Insect Detect camera trap in combination with an Allied Vision camera."
 requires-python = ">=3.13"
 license = "GPL-3.0-or-later"
 license-files = ["LICEN[CS]E.*"]
@@ -19,6 +19,7 @@ dependencies = [
     "pydantic >=2.13.4,<3",
     "pyyaml >=6.0.3,<7",
     "smbus2 >=0.6.1,<1",
+    "vmbpy @ https://github.com/alliedvision/VmbPy/releases/download/1.2.1/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl",
 ]
 
 [project.scripts]
@@ -27,9 +28,8 @@ capture = "insectdetect.capture:main"
 webapp = "insectdetect.webapp:main"
 
 [project.urls]
-Documentation = "https://maxsitt.github.io/insect-detect-docs/"
-Repository = "https://github.com/maxsitt/insect-detect"
-Issues = "https://github.com/maxsitt/insect-detect/issues"
+Repository = "https://github.com/beefriendly-earth/inspectai-cam"
+Issues = "https://github.com/beefriendly-earth/inspectai-cam/issues"
 
 [tool.uv]
 package = true
