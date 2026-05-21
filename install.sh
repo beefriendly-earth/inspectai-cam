@@ -1,19 +1,18 @@
 #!/bin/bash
 
-# Install the insect-detect software including dependencies, required packages and all setup steps
+# Install the inspectai-cam software including dependencies, required packages and all setup steps
 
-# Source:   https://github.com/maxsitt/insect-detect
+# Source:   https://github.com/beefriendly-earth/inspectai-cam
 # License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 # Author:   Maximilian Sittinger (https://github.com/maxsitt)
-# Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 # Immediately exit script on error, undefined variable, or pipe failure
 set -euo pipefail
 
-echo "==== Insect Detect Installer ===="
+echo "==== InspectAI-Cam Installer ===="
 echo
 
-# Set environment variable telling OpenBLAS to use ARM Cortex-A53 optimized code paths
+# Set environment variable telling OpenBLAS to use ARMv8 optimized code paths
 if ! grep -q "OPENBLAS_CORETYPE" ~/.bashrc; then
     echo "Setting OPENBLAS_CORETYPE=ARMV8 environment variable..."
     echo "export OPENBLAS_CORETYPE=ARMV8" >> ~/.bashrc
@@ -53,22 +52,22 @@ else
     echo "[2/5] uv is already installed."
 fi
 
-# Clone insect-detect repository into the home directory
+# Clone inspectai-cam repository into the home directory
 cd "$HOME"
-if [[ ! -d "insect-detect" ]]; then
+if [[ ! -d "inspectai-cam" ]]; then
     echo
-    echo "[3/5] Cloning 'insect-detect' repository..."
-    if ! git clone https://github.com/maxsitt/insect-detect; then
+    echo "[3/5] Cloning 'inspectai-cam' repository..."
+    if ! git clone https://github.com/beefriendly-earth/inspectai-cam; then
         echo "ERROR: Failed to clone repository. Please retry or check your internet connection."
         exit 1
     fi
 else
     echo
-    echo "[3/5] 'insect-detect' repository already exists."
+    echo "[3/5] 'inspectai-cam' repository already exists."
 fi
 
-# All remaining steps are run from the insect-detect repository directory
-cd "$HOME/insect-detect"
+# All remaining steps are run from the inspectai-cam repository directory
+cd "$HOME/inspectai-cam"
 
 # Create virtual environment with access to system site packages (required for GPIO access)
 echo
@@ -111,9 +110,9 @@ PATCHED_SERVICE=$(sed \
   -e "s|User=pi|User=${USER}|g" \
   -e "s|Group=pi|Group=${USER}|g" \
   -e "s|/home/pi|${HOME}|g" \
-  insect-detect-startup.service)
+  inspectai-cam-startup.service)
 
-if ! echo "${PATCHED_SERVICE}" | sudo tee /etc/systemd/system/insect-detect-startup.service > /dev/null; then
+if ! echo "${PATCHED_SERVICE}" | sudo tee /etc/systemd/system/inspectai-cam-startup.service > /dev/null; then
     echo "ERROR: Failed to install service file."
     exit 1
 fi
@@ -121,7 +120,7 @@ if ! sudo systemctl daemon-reload; then
     echo "ERROR: Failed to reload systemd daemon."
     exit 1
 fi
-if ! sudo systemctl enable insect-detect-startup.service; then
+if ! sudo systemctl enable inspectai-cam-startup.service; then
     echo "ERROR: Failed to enable startup service."
     exit 1
 fi
@@ -132,13 +131,13 @@ echo
 echo "The automatic startup service will be active after the next reboot."
 echo
 echo "Use the web app to configure your custom settings,"
-echo "or modify the 'insect-detect/configs/config.yaml' file directly."
+echo "or modify the 'inspectai-cam/configs/config.yaml' file directly."
 echo
 echo "To make 'uv' available in your current terminal session, run:"
 echo "  source \$HOME/.local/bin/env"
 echo
-echo "To run the scripts manually, first navigate into the insect-detect directory:"
-echo "  cd insect-detect"
+echo "To run the scripts manually, first navigate into the inspectai-cam directory:"
+echo "  cd inspectai-cam"
 echo
 echo "Then run the scripts with:"
 echo "  uv run webapp"
