@@ -1,9 +1,8 @@
 """Shared constants used across insect-detect modules.
 
-Source:   https://github.com/maxsitt/insect-detect
+Source:   https://github.com/beefriendly-earth/inspectai-cam
 License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 Author:   Maximilian Sittinger (https://github.com/maxsitt)
-Docs:     https://maxsitt.github.io/insect-detect-docs/
 """
 
 import socket
@@ -31,6 +30,9 @@ STREAMING_MARKER: Path = BASE_PATH / ".streaming_active"
 
 # OAK image sensor resolution (cropped from full sensor resolution, e.g. 4056x3040 for OAK-1)
 SENSOR_RES = (3840, 2160)
+
+# Fixed sensor-space ROI for area overlapping with spectral camera and small platform
+SENSOR_ROI = (2160, 750, 768, 992)
 
 # Resolution presets for high-resolution images (capture.py) and streamed frames (webapp.py)
 RESOLUTION_PRESETS: dict[str, tuple[int, int, int, int]] = {

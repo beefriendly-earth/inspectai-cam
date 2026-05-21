@@ -1,9 +1,8 @@
 """Capture detection-triggered images and save model/tracker metadata from OAK camera.
 
-Source:   https://github.com/maxsitt/insect-detect
+Source:   https://github.com/beefriendly-earth/inspectai-cam
 License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 Author:   Maximilian Sittinger (https://github.com/maxsitt)
-Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 Usage:
     Run with 'uv run capture' from the insect-detect directory ('cd insect-detect').
@@ -452,11 +451,19 @@ def _run_recording(
                                     # Set AE region to bbox of most recent active tracking ID (capped to 1 Hz)
                                     # Map bbox (frame-normalized) to sensor-space coordinates
                                     roi_x, roi_y, roi_w, roi_h = ctx.sensor_roi
+                                    # bbox_max is in post-rotation frame space (992x768, W×H)
+                                    # After 90° CW rotation:
+                                    # - frame x-axis maps to sensor ROI height axis (inverted)
+                                    # - frame y-axis maps to sensor ROI width axis
+                                    s_xmin = round(roi_x + bbox_max[1] * roi_w)
+                                    s_ymin = round(roi_y + (1.0 - bbox_max[2]) * roi_h)  # xmax -> ymin (inverted)
+                                    s_w = max(10, round((bbox_max[3] - bbox_max[1]) * roi_w))
+                                    s_h = max(10, round((bbox_max[2] - bbox_max[0]) * roi_h))
                                     rect_bbox: tuple[int, int, int, int] = (
-                                        max(1, round(roi_x + bbox_max[0] * roi_w)),
-                                        max(1, round(roi_y + bbox_max[1] * roi_h)),
-                                        max(10, round((bbox_max[2] - bbox_max[0]) * roi_w)),
-                                        max(10, round((bbox_max[3] - bbox_max[1]) * roi_h))
+                                        max(1, s_xmin),
+                                        max(1, s_ymin),
+                                        s_w,
+                                        s_h
                                     )
                                     exp_ctrl = dai.CameraControl().setAutoExposureRegion(*rect_bbox)
                                     ctx.q_camctrl.send(exp_ctrl)
