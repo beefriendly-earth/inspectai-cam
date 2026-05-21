@@ -3,17 +3,16 @@
 # Generate self-signed SSL certificates to enable HTTPS for the Insect Detect web app
 # HTTPS is required for the browser Geolocation API to get GPS coordinates
 
-# Source:   https://github.com/maxsitt/insect-detect
+# Source:   https://github.com/beefriendly-earth/inspectai-cam
 # License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 # Author:   Maximilian Sittinger (https://github.com/maxsitt)
-# Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 # Immediately exit script on error, undefined variable, or pipe failure
 set -euo pipefail
 
 DEVICE_HOSTNAME=$(hostname)
 CERT_DAYS=1825  # number of days the certificates are valid (default: 5 years)
-SSL_DIR="$HOME/insect-detect/ssl"
+SSL_DIR="$HOME/inspectai-cam/ssl"
 
 # Create SSL certificates directory
 mkdir -p "$SSL_DIR" || { echo "ERROR: Could not create '$SSL_DIR'."; exit 1; }
