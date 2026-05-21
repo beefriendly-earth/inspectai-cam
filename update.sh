@@ -1,20 +1,19 @@
 #!/bin/bash
 
-# Update the insect-detect software while backing up configuration files and handling local changes
+# Update the inspectai-cam software while backing up configuration files and handling local changes
 
-# Source:   https://github.com/maxsitt/insect-detect
+# Source:   https://github.com/beefriendly-earth/inspectai-cam
 # License:  GNU GPLv3 (https://choosealicense.com/licenses/gpl-3.0/)
 # Author:   Maximilian Sittinger (https://github.com/maxsitt)
-# Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 # Immediately exit script on error, undefined variable, or pipe failure
 set -euo pipefail
 
-echo "==== Insect Detect Updater ===="
+echo "==== InspectAI-Cam Updater ===="
 echo
 
 # Check prerequisites
-cd "$HOME/insect-detect" || { echo "ERROR: Directory $HOME/insect-detect not found."; exit 1; }
+cd "$HOME/inspectai-cam" || { echo "ERROR: Directory $HOME/inspectai-cam not found."; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "ERROR: Git is required but not installed."; exit 1; }
 command -v uv  >/dev/null 2>&1 || { echo "ERROR: uv is required but not installed."; exit 1; }
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: Not in a git repository."; exit 1; }
@@ -209,15 +208,15 @@ if echo "$CHANGED_FILES" | grep -q "^generate_ssl_certificates\.sh$"; then
 fi
 
 # Re-install systemd service if the service file was updated
-if echo "$CHANGED_FILES" | grep -q "^insect-detect-startup\.service$"; then
+if echo "$CHANGED_FILES" | grep -q "^inspectai-cam-startup\.service$"; then
     echo
     echo "Startup service file was updated. Reinstalling systemd service..."
     PATCHED_SERVICE=$(sed \
       -e "s|User=pi|User=${USER}|g" \
       -e "s|Group=pi|Group=${USER}|g" \
       -e "s|/home/pi|${HOME}|g" \
-      insect-detect-startup.service)
-    if ! echo "${PATCHED_SERVICE}" | sudo tee /etc/systemd/system/insect-detect-startup.service > /dev/null; then
+      inspectai-cam-startup.service)
+    if ! echo "${PATCHED_SERVICE}" | sudo tee /etc/systemd/system/inspectai-cam-startup.service > /dev/null; then
         echo "WARNING: Failed to reinstall systemd service."
         echo "You can reinstall it manually by running 'bash install.sh'."
     elif ! sudo systemctl daemon-reload; then
