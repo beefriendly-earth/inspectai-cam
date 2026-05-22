@@ -19,7 +19,7 @@ dependencies = [
     "pydantic >=2.13.4,<3",
     "pyyaml >=6.0.3,<7",
     "smbus2 >=0.6.1,<1",
-    "vmbpy @ https://github.com/alliedvision/VmbPy/releases/download/1.2.1/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl",
+    "vmbpy @ file:///home/pi/VimbaX_2026-1/api/python/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl",
 ]
 
 [project.scripts]

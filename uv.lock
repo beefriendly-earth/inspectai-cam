@@ -424,7 +424,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4,<3" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
     { name = "smbus2", specifier = ">=0.6.1,<1" },
-    { name = "vmbpy", url = "https://github.com/alliedvision/VmbPy/releases/download/1.2.1/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl" },
+    { name = "vmbpy", path = "/home/pi/VimbaX_2026-1/api/python/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl" },
 ]
 
 [[package]]
@@ -1232,9 +1232,9 @@ wheels = [
 [[package]]
 name = "vmbpy"
 version = "1.2.1"
-source = { url = "https://github.com/alliedvision/VmbPy/releases/download/1.2.1/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl" }
+source = { path = "/home/pi/VimbaX_2026-1/api/python/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl" }
 wheels = [
-    { url = "https://github.com/alliedvision/VmbPy/releases/download/1.2.1/vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:6e15a1f816e11966bacdb4ef254c68b498f49c0ebfd83efc2bfdfa464af3833e" },
+    { filename = "vmbpy-1.2.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:914952669ce2ff894f84ea709a02723b911987cdc7cf68b2aa2e5a6b1f93bd45" },
 ]
 
 [package.metadata]
