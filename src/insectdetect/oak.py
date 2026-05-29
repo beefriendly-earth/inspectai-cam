@@ -19,7 +19,7 @@ from typing import cast
 import depthai as dai
 
 from insectdetect.config import AppConfig, get_field_constraints
-from insectdetect.constants import MODELS_PATH, RESOLUTION_PRESETS, SENSOR_RES, SENSOR_ROI
+from insectdetect.constants import MODELS_PATH, RESOLUTION_PRESETS, SENSOR_RES
 
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
@@ -170,6 +170,14 @@ def create_pipeline(
     image_w, image_h, stream_w, stream_h = RESOLUTION_PRESETS[config.camera.image.resolution]
     out_w, out_h = (image_w, image_h)  # always use full resolution, even for webapp stream
 
+    # Get sensor ROI from config
+    sensor_roi = (
+        config.camera.sensor_roi.x,
+        config.camera.sensor_roi.y,
+        config.camera.sensor_roi.w,
+        config.camera.sensor_roi.h,
+    )
+
     # Create Camera node and set initial control options
     cam = pipeline.create(dai.node.Camera).build(
         sensorResolution=(sensor_w, sensor_h),
@@ -204,9 +212,9 @@ def create_pipeline(
             )
 
     # Set auto exposure and focus ROI to the defined sensor ROI
-    cam.initialControl.setAutoExposureRegion(*SENSOR_ROI)
+    cam.initialControl.setAutoExposureRegion(*sensor_roi)
     if config.camera.focus.mode != "manual":
-        cam.initialControl.setAutoFocusRegion(*SENSOR_ROI)
+        cam.initialControl.setAutoFocusRegion(*sensor_roi)
 
     # Request camera output with configured resolution
     cam_out = cam.requestOutput(
@@ -217,7 +225,7 @@ def create_pipeline(
     )
 
     # Calculate cropping parameters to crop to the defined sensor ROI
-    roi_x, roi_y, roi_w, roi_h = SENSOR_ROI
+    roi_x, roi_y, roi_w, roi_h = sensor_roi
     scale_x = out_w / sensor_w
     scale_y = out_h / sensor_h
     crop_x = round(roi_x * scale_x)
@@ -225,7 +233,7 @@ def create_pipeline(
     crop_w = round(roi_w * scale_x) // 32 * 32
     crop_h = round(roi_h * scale_y) // 32 * 32
 
-    # After 90° CW rotation, width and height are swapped for downstream nodes
+    # After 270° CW rotation, width and height are swapped for downstream nodes
     target_w = crop_h
     target_h = crop_w
 
@@ -233,7 +241,7 @@ def create_pipeline(
     crop_rot_manip = pipeline.create(dai.node.ImageManip)
     crop_rot_manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
     crop_rot_manip.initialConfig.addCrop(crop_x, crop_y, crop_w, crop_h)
-    crop_rot_manip.initialConfig.addRotateDeg(90)
+    crop_rot_manip.initialConfig.addRotateDeg(270)
     crop_rot_manip.setMaxOutputFrameSize(crop_w * crop_h * 3 // 2)
     crop_rot_manip.inputImage.setBlocking(False)
     cam_out.link(crop_rot_manip.inputImage)
@@ -318,4 +326,4 @@ def create_pipeline(
     q_camctrl = cam.inputControl.createInputQueue(maxSize=1, blocking=False)
 
     return (pipeline, q_frames, q_tracks, q_syslog, q_camctrl,
-            (target_w, target_h), nn_input_size, SENSOR_ROI, labels)
+            (target_w, target_h), nn_input_size, sensor_roi, labels)
