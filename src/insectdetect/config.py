@@ -25,7 +25,7 @@ import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from insectdetect.constants import (CONFIG_SELECTOR_PATH, CONFIGS_PATH, LED_GPIO_PINS,
-                                    WPA2_PASSWORD_MIN_LENGTH)
+                                    SENSOR_RES, SENSOR_ROI, WPA2_PASSWORD_MIN_LENGTH)
 
 # Initialize logger for this module
 logger = logging.getLogger(__name__)
@@ -47,6 +47,18 @@ def _float_representer(dumper: yaml.Dumper, value: float) -> yaml.ScalarNode:
 
 # Add custom float representer to ensure consistent formatting of float values in YAML config file
 yaml.add_representer(float, _float_representer)
+
+
+def _coerce_auto_mode(v: object) -> object:
+    """Coerce YAML boolean misparse of 'Off'/'On' to the correct string literal.
+
+    yaml.safe_load interprets unquoted Off/On as bool False/True (YAML 1.1).
+    """
+    if v is False:
+        return "Off"
+    if v is True:
+        return "Continuous"
+    return v
 
 
 class ConfigSelectorModel(BaseModel):
@@ -183,6 +195,34 @@ class IspConfig(BaseModel):
     chroma_denoise: int = Field(default=1, ge=0, le=4)
 
 
+class SensorRoiConfig(BaseModel):
+    """Sensor-space region of interest (ROI) for cropping the camera frame.
+
+    Defines the pixel offset and dimensions within the full sensor resolution.
+    - x: horizontal offset from the left edge of the sensor (in pixels)
+    - y: vertical offset from the top edge of the sensor (in pixels)
+    - w: width of the ROI (in pixels, must be a multiple of 32)
+    - h: height of the ROI (in pixels, must be a multiple of 32)
+    """
+    x: int = Field(default=SENSOR_ROI[0], ge=0, le=SENSOR_RES[0])
+    y: int = Field(default=SENSOR_ROI[1], ge=0, le=SENSOR_RES[1])
+    w: int = Field(default=SENSOR_ROI[2], ge=32, le=SENSOR_RES[0])
+    h: int = Field(default=SENSOR_ROI[3], ge=32, le=SENSOR_RES[1])
+
+    @model_validator(mode="after")
+    def roi_must_fit_within_sensor(self) -> "SensorRoiConfig":
+        """Ensure the ROI does not extend beyond the sensor boundaries."""
+        if self.x + self.w > SENSOR_RES[0]:
+            raise ValueError(
+                f"sensor_roi x ({self.x}) + w ({self.w}) exceeds sensor width ({SENSOR_RES[0]})"
+            )
+        if self.y + self.h > SENSOR_RES[1]:
+            raise ValueError(
+                f"sensor_roi y ({self.y}) + h ({self.h}) exceeds sensor height ({SENSOR_RES[1]})"
+            )
+        return self
+
+
 class CameraConfig(BaseModel):
     """OAK camera settings for frame rate, image quality, zoom, focus and ISP settings."""
     fps: int = Field(default=15, ge=1, le=20)
@@ -190,6 +230,7 @@ class CameraConfig(BaseModel):
     zoom: ZoomConfig = ZoomConfig()
     focus: FocusConfig = FocusConfig()
     isp: IspConfig = IspConfig()
+    sensor_roi: SensorRoiConfig = SensorRoiConfig()
 
 
 class AutoExposureRegionConfig(BaseModel):
@@ -500,6 +541,103 @@ class StartupConfig(BaseModel):
     auto_run: AutoRunConfig = AutoRunConfig()
 
 
+class VimbaExposureConfig(BaseModel):
+    """Vimba camera exposure settings.
+
+    - auto:     'Off' = manual, 'Once' = lock after first measurement, 'Continuous' = always adapting
+    - auto_min: minimum allowed exposure time (µs) for auto exposure
+    - auto_max: maximum allowed exposure time (µs) for auto exposure
+    - time:     fixed exposure time (µs) used when auto is 'Off'
+    """
+    auto: Literal["Off", "Once", "Continuous"] = "Continuous"
+    auto_min: float = Field(default=43.731, ge=43.731, le=8999992.0)
+    auto_max: float = Field(default=8999992.0, ge=43.731, le=8999992.0)
+    time: float = Field(default=19995.84, ge=43.731, le=8999992.0)
+
+    @field_validator("auto", mode="before")
+    @classmethod
+    def coerce_auto_mode(cls, v: object) -> object:
+        return _coerce_auto_mode(v)
+
+    @model_validator(mode="after")
+    def auto_min_must_be_less_than_auto_max(self) -> "VimbaExposureConfig":
+        """Ensure auto_min is strictly less than auto_max."""
+        if self.auto_min >= self.auto_max:
+            raise ValueError(
+                f"vimba.exposure.auto_min ({self.auto_min}) must be less than auto_max ({self.auto_max})"
+            )
+        return self
+
+
+class VimbaGainConfig(BaseModel):
+    """Vimba camera gain settings.
+
+    - auto:     'Off' = manual fixed gain, 'Once' = lock after first measurement,
+                'Continuous' = always adapting
+    - auto_min: minimum allowed gain (dB) for auto gain
+    - auto_max: maximum allowed gain (dB) for auto gain
+    - value:    fixed gain value (dB) used when auto is 'Off'
+    """
+    auto: Literal["Off", "Once", "Continuous"] = "Off"
+    auto_min: float = Field(default=0.0, ge=0.0, le=48.0)
+    auto_max: float = Field(default=48.0, ge=0.0, le=48.0)
+    value: float = Field(default=0.0, ge=0.0, le=48.0)
+
+    @field_validator("auto", mode="before")
+    @classmethod
+    def coerce_auto_mode(cls, v: object) -> object:
+        return _coerce_auto_mode(v)
+
+    @model_validator(mode="after")
+    def auto_min_must_be_less_than_auto_max(self) -> "VimbaGainConfig":
+        """Ensure auto_min is strictly less than auto_max."""
+        if self.auto_min >= self.auto_max:
+            raise ValueError(
+                f"vimba.gain.auto_min ({self.auto_min}) must be less than auto_max ({self.auto_max})"
+            )
+        return self
+
+
+class VimbaAutoConfig(BaseModel):
+    """Vimba camera auto-exposure/gain controller settings.
+
+    - target:     target mean image intensity (%) the controller aims for (0-100)
+    - precedence: 'Minimizenoise' favors longer exposure + lower gain (better SNR,
+                  may blur fast movement); 'Minimizeblur' favors shorter exposure +
+                  higher gain (freezes motion, higher noise)
+    - rate:       controller adaptation speed (iterations/s)
+    """
+    target: float = Field(default=50.0, ge=0.0, le=100.0)
+    precedence: Literal["Minimizenoise", "Minimizeblur"] = "Minimizenoise"
+    rate: int = Field(default=100, ge=1, le=1000)
+
+
+class VimbaConfig(BaseModel):
+    """Allied Vision Vimba (spectral) camera settings.
+
+    - fps:              acquisition frame rate (frames/s); requires fps_enable=True
+    - fps_enable:       enable custom frame rate; if False, camera runs at maximum rate
+    - capture_interval: minimum time (s) between saved spectral frames on detection trigger
+    - temp_max:         maximum allowed sensor temperature (°C) before recording is stopped
+    - temp_check:       interval (in seconds) to check the sensor temperature during recording
+    - exposure:         exposure auto mode, time and range settings
+    - gain:             gain auto mode, value and range settings
+    - auto:             auto-exposure/gain controller target and behavior
+
+    Note: ExposureMode is always 'Timed', binning is always disabled (full resolution),
+    BlackLevel is always 0 and Gamma is always 1.0 to preserve linear radiometric response.
+    These are set unconditionally in the camera setup and are not user-configurable.
+    """
+    fps: float = Field(default=2.0, ge=0.1, le=2.0)
+    fps_enable: bool = False
+    capture_interval: float = Field(default=1.0, ge=0.1, le=600.0)
+    temp_max: int = Field(default=75, ge=50, le=85)
+    temp_check: int = Field(default=30, ge=1, le=600)
+    exposure: VimbaExposureConfig = VimbaExposureConfig()
+    gain: VimbaGainConfig = VimbaGainConfig()
+    auto: VimbaAutoConfig = VimbaAutoConfig()
+
+
 class AppConfig(BaseModel):
     """Validated model containing all insect-detect configuration settings.
 
@@ -520,6 +658,7 @@ class AppConfig(BaseModel):
     metrics: MetricsConfig = MetricsConfig()
     storage: StorageConfig = StorageConfig()
     startup: StartupConfig = StartupConfig()
+    vimba: VimbaConfig = VimbaConfig()
 
 
 def get_field_constraints(

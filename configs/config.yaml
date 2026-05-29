@@ -8,7 +8,7 @@ deployment:
   distance: null
   notes: null
 camera:
-  fps: 15
+  fps: 5
   image:
     resolution: 4k
     quality: 80
@@ -16,10 +16,10 @@ camera:
     enabled: false
     factor: 1.0
   focus:
-    mode: continuous
+    mode: manual
     type: lens_pos
     manual:
-      lens_pos: 156
+      lens_pos: 153
       distance: 19
     range:
       lens_pos:
@@ -32,6 +32,11 @@ camera:
     sharpness: 1
     luma_denoise: 1
     chroma_denoise: 1
+  sensor_roi:
+    x: 2240
+    y: 540
+    w: 768
+    h: 992
 detection:
   model: platform_insect-detect-tiled_v2-0-0.tar.xz
   num_shaves: 4
@@ -47,7 +52,7 @@ recording:
     default: 40
   interval:
     detection: 1.0
-    timelapse: 600.0
+    timelapse: 300.0
   shutdown:
     enabled: true
 processing:
@@ -74,7 +79,7 @@ network:
 powermanager:
   enabled: true
   model: wittypi
-  charge_min: 30
+  charge_min: 80
   charge_check: 30
 oak:
   temp_max: 100
@@ -83,7 +88,7 @@ led:
   enabled: false
   gpio_pin: 18
 metrics:
-  enabled: false
+  enabled: true
   interval: 30
 storage:
   disk_min: 1000
@@ -104,3 +109,23 @@ startup:
     primary: capture
     fallback: null
     delay: 180
+vimba:
+  fps: 2.0
+  fps_enable: false
+  capture_interval: 1.0
+  temp_max: 75
+  temp_check: 30
+  exposure:
+    auto: Continuous
+    auto_min: 43.731
+    auto_max: 8999992.0
+    time: 19995.84
+  gain:
+    auto: "Off"
+    auto_min: 0.0
+    auto_max: 48.0
+    value: 0.0
+  auto:
+    target: 50.0
+    precedence: Minimizenoise
+    rate: 100
