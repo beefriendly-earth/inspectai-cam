@@ -32,7 +32,7 @@ STREAMING_MARKER: Path = BASE_PATH / ".streaming_active"
 SENSOR_RES = (3840, 2160)
 
 # Fixed sensor-space ROI for area overlapping with spectral camera and small platform
-SENSOR_ROI = (2160, 750, 768, 992)
+SENSOR_ROI = (2240, 540, 768, 992)
 
 # Resolution presets for high-resolution images (capture.py) and streamed frames (webapp.py)
 RESOLUTION_PRESETS: dict[str, tuple[int, int, int, int]] = {
