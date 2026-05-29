@@ -34,6 +34,7 @@ import pty
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -42,11 +43,14 @@ from pathlib import Path
 from types import FrameType
 from typing import cast
 
+import cv2
 import depthai as dai
+import numpy as np
 from fastapi.responses import StreamingResponse
 from gpiozero import LED
 from nicegui import Client, app, binding, core, run, ui
 from nicegui.events import ValueChangeEventArguments, XtermDataEventArguments
+from vmbpy import *
 
 from insectdetect.config import (AppConfig, check_config_changes, get_field_constraints,
                                  load_config_selector, load_config_yaml, update_config_selector,
@@ -78,6 +82,7 @@ _CONSTRAINT_PATHS: list[str] = [
     "camera.focus.range.distance.min", "camera.focus.range.distance.max",
     "camera.focus.range.lens_pos.min", "camera.focus.range.lens_pos.max",
     "camera.isp.sharpness", "camera.isp.luma_denoise", "camera.isp.chroma_denoise",
+    "camera.sensor_roi.x", "camera.sensor_roi.y", "camera.sensor_roi.w", "camera.sensor_roi.h",
     "detection.num_shaves", "detection.conf_threshold",
     "recording.interval.detection", "recording.interval.timelapse", "recording.duration.default",
     "recording.duration.battery.high", "recording.duration.battery.medium", "recording.duration.battery.low",
@@ -85,12 +90,174 @@ _CONSTRAINT_PATHS: list[str] = [
     "powermanager.charge_min", "powermanager.charge_check", "oak.temp_max", "oak.temp_check",
     "metrics.interval", "storage.disk_min", "storage.disk_check", "storage.archive.disk_low",
     "startup.auto_run.delay",
+    "vimba.fps", "vimba.capture_interval", "vimba.temp_max", "vimba.temp_check",
+    "vimba.exposure.auto_min", "vimba.exposure.auto_max", "vimba.exposure.time",
+    "vimba.gain.auto_min", "vimba.gain.auto_max", "vimba.gain.value",
+    "vimba.auto.target", "vimba.auto.rate",
 ]
 
 FIELD_CONSTRAINTS: dict[str, dict[str, int | float | None]] = {
     path: get_field_constraints(AppConfig, *path.split("."))
     for path in _CONSTRAINT_PATHS
 }
+
+VIMBA_STREAM_WIDTH = 1376
+VIMBA_STREAM_HEIGHT = 1002
+VIMBA_JPEG_QUALITY = 70
+VIMBA_STABILIZATION = 2
+
+
+class _VimbaFrameBuffer:
+    """Thread-safe single-frame buffer for the latest Vimba JPEG."""
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jpeg: bytes = PLACEHOLDER_PNG_BYTES
+        self._length: bytes = PLACEHOLDER_PNG_BYTES_LENGTH
+        self._content_type: bytes = b"image/png"
+
+    def put(self, jpeg: bytes) -> None:
+        with self._lock:
+            self._jpeg = jpeg
+            self._length = str(len(jpeg)).encode()
+            self._content_type = b"image/jpeg"
+
+    def reset(self) -> None:
+        """Reset buffer to placeholder PNG (called on camera stop)."""
+        with self._lock:
+            self._jpeg = PLACEHOLDER_PNG_BYTES
+            self._length = PLACEHOLDER_PNG_BYTES_LENGTH
+            self._content_type = b"image/png"
+
+    def get(self) -> tuple[bytes, bytes, bytes]:
+        """Returns (jpeg_bytes, length_bytes, content_type_bytes)."""
+        with self._lock:
+            return self._jpeg, self._length, self._content_type
+
+
+class _VimbaStreamHandler:
+    def __call__(self, cam: "Camera", stream: "Stream", frame: "Frame") -> None:
+        if frame.get_status() != FrameStatus.Complete:
+            cam.queue_frame(frame)
+            return
+        img = np.squeeze(frame.as_numpy_ndarray()).copy()
+        cam.queue_frame(frame)  # requeue immediately after copy, before encoding
+        img = cv2.resize(img, (VIMBA_STREAM_WIDTH, VIMBA_STREAM_HEIGHT),
+                         interpolation=cv2.INTER_AREA)
+        ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, VIMBA_JPEG_QUALITY])
+        if ok:
+            app.state.vimba_frame_buffer.put(jpeg.tobytes())
+
+
+def _vimba_setup_camera(cam: "Camera") -> None:
+    """Set up Vimba camera for live streaming in the web app.
+
+    Args:
+        cam: Active Vimba Camera instance.
+    """
+    vc = app.state.config.vimba
+
+    # Enforce Mono8 regardless of previous camera state
+    try:
+        cam.set_pixel_format(PixelFormat.Mono8)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not set Mono8 pixel format")
+
+    # Frame rate
+    try:
+        cam.get_feature_by_name("AcquisitionFrameRateEnable").set(vc.fps_enable)
+        if vc.fps_enable:
+            try:
+                cam.get_feature_by_name("AcquisitionFrameRate").set(vc.fps)
+            except (AttributeError, VmbFeatureError):
+                logger.warning("Vimba: could not set AcquisitionFrameRate to %s fps", vc.fps)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not set AcquisitionFrameRateEnable")
+
+    # Exposure
+    try:
+        cam.get_feature_by_name("ExposureAuto").set(vc.exposure.auto)
+        if vc.exposure.auto != "Off":
+            cam.get_feature_by_name("ExposureAutoMin").set(vc.exposure.auto_min)
+            cam.get_feature_by_name("ExposureAutoMax").set(vc.exposure.auto_max)
+        else:
+            cam.get_feature_by_name("ExposureTime").set(vc.exposure.time)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure exposure settings")
+
+    # Gain
+    try:
+        cam.get_feature_by_name("GainAuto").set(vc.gain.auto)
+        if vc.gain.auto != "Off":
+            cam.get_feature_by_name("GainAutoMin").set(vc.gain.auto_min)
+            cam.get_feature_by_name("GainAutoMax").set(vc.gain.auto_max)
+        else:
+            cam.get_feature_by_name("Gain").set(vc.gain.value)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure gain settings")
+
+    # Auto-exposure/gain controller
+    try:
+        cam.get_feature_by_name("IntensityControllerTarget").set(vc.auto.target)
+        cam.get_feature_by_name("IntensityAutoPrecedence").set(vc.auto.precedence)
+        cam.get_feature_by_name("IntensityControllerRate").set(vc.auto.rate)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure auto intensity controller settings")
+
+
+def _vimba_camera_thread(stop_event: threading.Event) -> None:
+    """Run Vimba camera streaming in a background thread for the web app live preview."""
+    try:
+        with VmbSystem.get_instance() as vmb:
+            cams = vmb.get_all_cameras()
+            if not cams:
+                logger.warning("Vimba: no cameras found")
+                app.state.vimba_error = True
+                return
+            with cams[0] as cam:
+                _vimba_setup_camera(cam)
+                time.sleep(VIMBA_STABILIZATION)
+                handler = _VimbaStreamHandler()
+                cam.start_streaming(handler=handler, buffer_count=5)
+                logger.info("Vimba camera streaming started")
+                app.state.vimba_ready = True
+                try:
+                    stop_event.wait()
+                except Exception:
+                    pass
+                finally:
+                    app.state.vimba_ready = False
+                    try:
+                        cam.stop_streaming()
+                        logger.info("Vimba camera streaming stopped")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.error("Vimba camera error: %s", e)
+        app.state.vimba_error = True
+        app.state.vimba_ready = False
+
+
+def start_vimba_camera() -> bool:
+    """Start Vimba camera thread. Returns True if started successfully."""
+    stop_event = threading.Event()
+    t = threading.Thread(target=_vimba_camera_thread, args=(stop_event,), daemon=False)
+    t.start()
+    app.state.vimba_stop_event = stop_event
+    app.state.vimba_thread = t
+    return True
+
+
+def stop_vimba_camera() -> None:
+    """Signal the Vimba camera thread to stop (non-blocking)."""
+    ev: threading.Event | None = getattr(app.state, "vimba_stop_event", None)
+    if ev:
+        ev.set()
+    if getattr(app.state, "vimba_frame_buffer", None):
+        app.state.vimba_frame_buffer.reset()
+    app.state.vimba_ready = False
+    app.state.vimba_error = False
+    app.state.vimba_stop_event = None
+    app.state.vimba_thread = None
 
 
 @ui.page("/")
@@ -160,6 +327,9 @@ def create_ui_layout() -> None:
             ui.separator().classes("bg-emerald-500 h-0.5")
             with ui.expansion("System Settings", icon="settings_applications").classes("w-full font-bold"):
                 create_system_settings()
+            ui.separator().classes("bg-emerald-500 h-0.5")
+            with ui.expansion("Spectral Camera Settings", icon="camera").classes("w-full font-bold"):
+                create_vimba_settings()
             ui.separator().classes("bg-emerald-500 h-0.5")
             with ui.expansion("Startup Settings", icon="rocket_launch").classes("w-full font-bold"):
                 create_startup_settings()
@@ -277,6 +447,12 @@ async def start_camera() -> None:
         "oak_ram_usage_cmx": "NA",
         "oak_ram_available_cmx": "NA",
     }
+    app.state.stream_source = "oak"
+    app.state.vimba_frame_buffer = _VimbaFrameBuffer()
+    app.state.vimba_ready = False
+    app.state.vimba_error = False
+    app.state.vimba_stop_event = None
+    app.state.vimba_thread = None
 
     (app.state.pipeline, app.state.q_frames, app.state.q_tracks, app.state.q_syslog,
      app.state.q_camctrl, app.state.frame_size, app.state.nn_input_size, app.state.sensor_roi,
@@ -295,6 +471,10 @@ async def start_camera() -> None:
 
 async def close_camera() -> None:
     """Stop streaming and OAK pipeline, clean up resources."""
+    # Switch stream source away from vimba first so frame_generator stops holding
+    # an active MJPEG connection, which would block VmbSystem context manager exit
+    app.state.stream_source = "oak"
+
     for queue in ("q_frames", "q_tracks", "q_syslog", "q_camctrl"):
         if getattr(app.state, queue, None):
             setattr(app.state, queue, None)
@@ -306,6 +486,18 @@ async def close_camera() -> None:
     if getattr(app.state, "sys_info_timer", None):
         app.state.sys_info_timer.deactivate()
         app.state.sys_info_timer = None
+
+    # Signal Vimba thread to stop, then wait off the event loop
+    ev: threading.Event | None = getattr(app.state, "vimba_stop_event", None)
+    t: threading.Thread | None = getattr(app.state, "vimba_thread", None)
+    if ev:
+        ev.set()
+    if t and t.is_alive():
+        await run.io_bound(t.join, 10)  # blocks a thread-pool worker, not the event loop
+        if t.is_alive():
+            logger.warning("Vimba camera thread did not stop within timeout.")
+    app.state.vimba_stop_event = None
+    app.state.vimba_thread = None
 
     if getattr(app.state, "pipeline", None):
         app.state.pipeline.stop()
@@ -335,35 +527,44 @@ def get_frame(q_frames: dai.MessageQueue | None) -> tuple[bytes, bytes, int, int
 
 
 async def frame_generator() -> AsyncGenerator[bytes, None]:
-    """Yield MJPEG-encoded frames asynchronously and update camera parameters."""
+    """Yield MJPEG-encoded frames from the active camera source."""
     try:
         next_tick = time.monotonic()
-        while getattr(app.state, "q_frames", None):
-            frame_data = get_frame(app.state.q_frames)
-            if frame_data is not None:
-                frame_bytes, frame_bytes_length, lens_pos, iso_sens, exp_time = frame_data
+        while True:
+            source = getattr(app.state, "stream_source", "oak")
 
+            if source == "vimba":
+                frame_bytes, frame_bytes_length, content_type = app.state.vimba_frame_buffer.get()
                 yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Type: " + content_type + b"\r\n"
                        b"Content-Length: " + frame_bytes_length + b"\r\n\r\n"
                        + frame_bytes + b"\r\n")
-
-                # Update camera parameters twice per second
-                app.state.frame_count += 1
-                current_time = time.monotonic()
-                elapsed_time = current_time - app.state.prev_time
-                if elapsed_time > 0.5:
-                    app.state.fps = round(app.state.frame_count / elapsed_time, 2)
-                    app.state.lens_pos = lens_pos if lens_pos is not None else 0
-                    app.state.iso_sens = iso_sens if iso_sens is not None else 0
-                    app.state.exp_time = exp_time if exp_time is not None else 0
-                    app.state.frame_count = 0
-                    app.state.prev_time = current_time
             else:
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/png\r\n"
-                       b"Content-Length: " + PLACEHOLDER_PNG_BYTES_LENGTH + b"\r\n\r\n"
-                       + PLACEHOLDER_PNG_BYTES + b"\r\n")
+                frame_data = get_frame(getattr(app.state, "q_frames", None))
+                if frame_data is not None:
+                    frame_bytes, frame_bytes_length, lens_pos, iso_sens, exp_time = frame_data
+
+                    yield (b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + frame_bytes_length + b"\r\n\r\n"
+                        + frame_bytes + b"\r\n")
+
+                    # Update camera parameters twice per second
+                    app.state.frame_count += 1
+                    current_time = time.monotonic()
+                    elapsed_time = current_time - app.state.prev_time
+                    if elapsed_time > 0.5:
+                        app.state.fps = round(app.state.frame_count / elapsed_time, 2)
+                        app.state.lens_pos = lens_pos if lens_pos is not None else 0
+                        app.state.iso_sens = iso_sens if iso_sens is not None else 0
+                        app.state.exp_time = exp_time if exp_time is not None else 0
+                        app.state.frame_count = 0
+                        app.state.prev_time = current_time
+                else:
+                    yield (b"--frame\r\n"
+                        b"Content-Type: image/png\r\n"
+                        b"Content-Length: " + PLACEHOLDER_PNG_BYTES_LENGTH + b"\r\n\r\n"
+                        + PLACEHOLDER_PNG_BYTES + b"\r\n")
 
             next_tick += app.state.refresh_interval
             delay = next_tick - time.monotonic()
@@ -428,11 +629,15 @@ async def get_tracker_data() -> list[dict] | None:
                     # Set AE region to bbox of most recent active tracking ID (capped to 1 Hz)
                     # Map bbox (frame-normalized) to sensor-space coordinates
                     roi_x, roi_y, roi_w, roi_h = app.state.sensor_roi
+                    # Map bbox (frame-normalized) back to sensor-space coordinates.
+                    # After 270° CW (= 90° CCW) rotation:
+                    # - frame y-axis → sensor x-axis (inverted: 1 - fy)
+                    # - frame x-axis → sensor y-axis (not inverted)
                     rect_bbox: tuple[int, int, int, int] = (
-                        max(1, round(roi_x + bbox_max[0] * roi_w)),
-                        max(1, round(roi_y + bbox_max[1] * roi_h)),
-                        max(10, round((bbox_max[2] - bbox_max[0]) * roi_w)),
-                        max(10, round((bbox_max[3] - bbox_max[1]) * roi_h)),
+                        max(1, round(roi_x + (1.0 - bbox_max[3]) * roi_w)),
+                        max(1, round(roi_y + bbox_max[0] * roi_h)),
+                        max(10, round((bbox_max[3] - bbox_max[1]) * roi_w)),
+                        max(10, round((bbox_max[2] - bbox_max[0]) * roi_h)),
                     )
                     exp_ctrl = dai.CameraControl().setAutoExposureRegion(*rect_bbox)
                     app.state.q_camctrl.send(exp_ctrl)
@@ -541,6 +746,9 @@ def build_roi_overlay(zoom: float) -> str:
 
 async def update_overlay() -> None:
     """Update SVG overlay with pending zoom ROI (if applicable) and latest model/tracker data."""
+    if getattr(app.state, "stream_source", "oak") == "vimba":
+        return
+
     if getattr(app.state, "roi_layer", None) is not None:
         zoom_enabled: bool = app.state.config_updates["camera"]["zoom"]["enabled"]
         zoom_factor: float = app.state.config_updates["camera"]["zoom"]["factor"]
@@ -712,6 +920,50 @@ def create_control_elements() -> None:
          .props("label")
          .bind_value(app.state.config_updates["camera"]["focus"]["range"], "lens_pos",
                      forward=lambda v: {"min": int(v["min"]), "max": int(v["max"])} if v is not None else None))
+
+    # Toggle for camera source selection with async handler to manage Vimba camera startup
+    async def toggle_camera_source(e: ValueChangeEventArguments) -> None:
+        if e.value == "vimba":
+            app.state.vimba_error = False
+            started = start_vimba_camera()
+            if not started:
+                camera_toggle.set_value("oak")
+                return
+            deadline = time.monotonic() + VIMBA_STABILIZATION + 5
+            while not getattr(app.state, "vimba_ready", False):
+                if getattr(app.state, "vimba_error", False):
+                    ui.notification("Vimba camera failed to start. Check logs.", type="negative", timeout=4)
+                    stop_vimba_camera()
+                    camera_toggle.set_value("oak")
+                    return
+                if time.monotonic() > deadline:
+                    ui.notification("Vimba camera timed out.", type="negative", timeout=3)
+                    stop_vimba_camera()
+                    camera_toggle.set_value("oak")
+                    return
+                await asyncio.sleep(0.1)
+            app.state.stream_source = "vimba"
+            # Clear tracker overlay and ROI layer when switching to Vimba
+            if getattr(app.state, "frame_ii", None):
+                app.state.frame_ii.content = ""
+                app.state.last_overlay_empty = True
+            if getattr(app.state, "roi_layer", None):
+                app.state.roi_layer.content = ""
+                app.state.last_roi_layer_empty = True
+            ui.notification("Switched to Vimba camera.", type="positive", timeout=2)
+        else:
+            app.state.stream_source = "oak"
+            stop_vimba_camera()
+            ui.notification("Switched to OAK camera.", type="positive", timeout=2)
+
+    with ui.row(align_items="center").classes("w-full gap-2"):
+        ui.label("Camera Source:").classes("font-bold")
+        camera_toggle = (
+            ui.toggle({"oak": "OAK", "vimba": "Vimba"},
+                        value="oak",
+                        on_change=toggle_camera_source)
+            .props("dense")
+        )
 
     with ui.row(align_items="center").classes("w-full gap-2"):
         # Switches to toggle dark mode and model/tracker overlay
@@ -1028,6 +1280,46 @@ def create_camera_settings() -> None:
              .bind_value(app.state.config_updates["camera"]["isp"], "chroma_denoise",
                          forward=lambda v: int(v) if v is not None else None))
 
+        grid_separator()
+        (ui.label("Sensor ROI").classes("font-bold")
+         .tooltip("Sensor-space region of interest for cropping the camera frame. "
+                  "Save config and restart to take effect.\n"
+                  "x/y: pixel offset from top-left corner, w/h: width and height in pixels."))
+        with ui.column().classes("w-full gap-1"):
+            with ui.row(align_items="center").classes("w-full gap-2"):
+                c = FIELD_CONSTRAINTS["camera.sensor_roi.x"]
+                (ui.number(label="X Offset", placeholder=app.state.config.camera.sensor_roi.x,
+                           min=c["min"], max=c["max"], precision=0, step=1, suffix="px",
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("flex-1")
+                 .bind_value(app.state.config_updates["camera"]["sensor_roi"], "x",
+                             forward=lambda v: int(v) if v is not None else None))
+                c = FIELD_CONSTRAINTS["camera.sensor_roi.y"]
+                (ui.number(label="Y Offset", placeholder=app.state.config.camera.sensor_roi.y,
+                           min=c["min"], max=c["max"], precision=0, step=1, suffix="px",
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("flex-1")
+                 .bind_value(app.state.config_updates["camera"]["sensor_roi"], "y",
+                             forward=lambda v: int(v) if v is not None else None))
+            with ui.row(align_items="center").classes("w-full gap-2"):
+                c = FIELD_CONSTRAINTS["camera.sensor_roi.w"]
+                (ui.number(label="Width", placeholder=app.state.config.camera.sensor_roi.w,
+                           min=c["min"], max=c["max"], precision=0, step=32, suffix="px",
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("flex-1")
+                 .bind_value(app.state.config_updates["camera"]["sensor_roi"], "w",
+                             forward=lambda v: int(v) if v is not None else None))
+                c = FIELD_CONSTRAINTS["camera.sensor_roi.h"]
+                (ui.number(label="Height", placeholder=app.state.config.camera.sensor_roi.h,
+                           min=c["min"], max=c["max"], precision=0, step=32, suffix="px",
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("flex-1")
+                 .bind_value(app.state.config_updates["camera"]["sensor_roi"], "h",
+                             forward=lambda v: int(v) if v is not None else None))
 
 async def on_ae_region_change(e: ValueChangeEventArguments) -> None:
     """Reset auto AE region to full frame if setting is disabled."""
@@ -1417,6 +1709,183 @@ def create_system_settings() -> None:
              .bind_visibility_from(app.state.config_updates["storage"]["upload"], "enabled")
              .bind_value(app.state.config_updates["storage"]["upload"], "content"))
 
+
+def create_vimba_settings() -> None:
+    """Create UI elements and config binding for Allied Vision Vimba spectral camera settings."""
+    with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
+        (ui.label("Frame Rate").classes("font-bold")
+         .tooltip("Custom acquisition frame rate; only active if 'Enable Custom FPS' is on. "
+                  "Camera runs at its maximum free-running rate (~2 fps) when disabled."))
+        with ui.column().classes("w-full gap-1"):
+            (ui.switch("Enable Custom FPS").props("color=green").classes("font-bold")
+             .bind_value(app.state.config_updates["vimba"], "fps_enable"))
+            c = FIELD_CONSTRAINTS["vimba.fps"]
+            (ui.number(label="FPS", placeholder=app.state.config.vimba.fps,
+                       min=float(c["min"]), max=float(c["max"]), precision=1, step=0.1,
+                       validation={f"Required value between {c['min']}-{c['max']}":
+                                   lambda v, c=c: validate_number(v, c["min"], c["max"])})
+             .bind_visibility_from(app.state.config_updates["vimba"], "fps_enable")
+             .bind_value(app.state.config_updates["vimba"], "fps",
+                         forward=lambda v: float(v) if v is not None else None))
+
+        grid_separator()
+        c = FIELD_CONSTRAINTS["vimba.capture_interval"]
+        (ui.label("Detection Capture Interval").classes("font-bold")
+         .tooltip("Minimum time between saved spectral frames on detection trigger. "
+                  "Timelapse triggers always save a spectral frame regardless of this interval."))
+        (ui.number(label="Interval", placeholder=app.state.config.vimba.capture_interval,
+                   min=float(c["min"]), max=float(c["max"]), precision=1, step=0.1, suffix="seconds",
+                   validation={f"Required value between {c['min']}-{c['max']}":
+                               lambda v, c=c: validate_number(v, c["min"], c["max"])})
+         .bind_value(app.state.config_updates["vimba"], "capture_interval",
+                     forward=lambda v: float(v) if v is not None else None))
+
+        grid_separator()
+        (ui.label("Camera Temperature").classes("font-bold")
+         .tooltip("Maximum allowed camera temperature (°C) before recording is stopped. "
+                  "Reads Mainboard sensor. Operating limit is 85°C (measured at enclosure)."))
+        with ui.row(align_items="center").classes("w-full gap-2"):
+            c = FIELD_CONSTRAINTS["vimba.temp_max"]
+            (ui.number(label="Max. Temperature", placeholder=app.state.config.vimba.temp_max,
+                       min=c["min"], max=c["max"], precision=0, step=1, suffix="°C",
+                       validation={f"Required value between {c['min']}-{c['max']}":
+                                   lambda v, c=c: validate_number(v, c["min"], c["max"])})
+             .classes("flex-1")
+             .bind_value(app.state.config_updates["vimba"], "temp_max",
+                         forward=lambda v: int(v) if v is not None else None))
+            c = FIELD_CONSTRAINTS["vimba.temp_check"]
+            (ui.number(label="Check Interval", placeholder=app.state.config.vimba.temp_check,
+                       min=float(c["min"]), max=float(c["max"]), precision=0, step=5, suffix="seconds",
+                       validation={f"Required value between {c['min']}-{c['max']}":
+                                   lambda v, c=c: validate_number(v, c["min"], c["max"])})
+             .classes("flex-1")
+             .bind_value(app.state.config_updates["vimba"], "temp_check",
+                         forward=lambda v: int(v) if v is not None else None))
+
+        grid_separator()
+        (ui.label("Exposure").classes("font-bold")
+         .tooltip("Auto exposure mode and range, or fixed exposure time when auto is Off."))
+        with ui.column().classes("w-full gap-1"):
+            (ui.select(["Continuous", "Once", "Off"], label="Auto Mode")
+             .classes("w-full")
+             .bind_value(app.state.config_updates["vimba"]["exposure"], "auto"))
+
+            # Auto exposure range (visible when auto is not Off)
+            with (ui.column().classes("w-full gap-1")
+                  .bind_visibility_from(app.state.config_updates["vimba"]["exposure"], "auto",
+                                        backward=lambda v: v != "Off")):
+                with ui.row(align_items="center").classes("w-full gap-2"):
+                    c = FIELD_CONSTRAINTS["vimba.exposure.auto_min"]
+                    (ui.number(label="Auto Min (µs)",
+                               placeholder=app.state.config.vimba.exposure.auto_min,
+                               min=float(c["min"]), max=float(c["max"]), precision=3, step=1,
+                               validation={f"Required value between {c['min']}-{c['max']}":
+                                           lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                     .classes("flex-1")
+                     .bind_value(app.state.config_updates["vimba"]["exposure"], "auto_min",
+                                 forward=lambda v: float(v) if v is not None else None))
+                    c = FIELD_CONSTRAINTS["vimba.exposure.auto_max"]
+                    (ui.number(label="Auto Max (µs)",
+                               placeholder=app.state.config.vimba.exposure.auto_max,
+                               min=float(c["min"]), max=float(c["max"]), precision=3, step=1,
+                               validation={f"Required value between {c['min']}-{c['max']}":
+                                           lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                     .classes("flex-1")
+                     .bind_value(app.state.config_updates["vimba"]["exposure"], "auto_max",
+                                 forward=lambda v: float(v) if v is not None else None))
+
+            # Fixed exposure time (visible when auto is Off)
+            with (ui.column().classes("w-full")
+                  .bind_visibility_from(app.state.config_updates["vimba"]["exposure"], "auto",
+                                        backward=lambda v: v == "Off")):
+                c = FIELD_CONSTRAINTS["vimba.exposure.time"]
+                (ui.number(label="Exposure Time (µs)",
+                           placeholder=app.state.config.vimba.exposure.time,
+                           min=float(c["min"]), max=float(c["max"]), precision=3, step=1,
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("w-full")
+                 .bind_value(app.state.config_updates["vimba"]["exposure"], "time",
+                             forward=lambda v: float(v) if v is not None else None))
+
+        grid_separator()
+        (ui.label("Gain").classes("font-bold")
+         .tooltip("Auto gain mode and range, or fixed gain value when auto is Off."))
+        with ui.column().classes("w-full gap-1"):
+            (ui.select(["Off", "Once", "Continuous"], label="Auto Mode")
+             .classes("w-full")
+             .bind_value(app.state.config_updates["vimba"]["gain"], "auto"))
+
+            # Auto gain range (visible when auto is not Off)
+            with (ui.column().classes("w-full gap-1")
+                  .bind_visibility_from(app.state.config_updates["vimba"]["gain"], "auto",
+                                        backward=lambda v: v != "Off")):
+                with ui.row(align_items="center").classes("w-full gap-2"):
+                    c = FIELD_CONSTRAINTS["vimba.gain.auto_min"]
+                    (ui.number(label="Auto Min (dB)",
+                               placeholder=app.state.config.vimba.gain.auto_min,
+                               min=float(c["min"]), max=float(c["max"]), precision=1, step=0.1,
+                               validation={f"Required value between {c['min']}-{c['max']}":
+                                           lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                     .classes("flex-1")
+                     .bind_value(app.state.config_updates["vimba"]["gain"], "auto_min",
+                                 forward=lambda v: float(v) if v is not None else None))
+                    c = FIELD_CONSTRAINTS["vimba.gain.auto_max"]
+                    (ui.number(label="Auto Max (dB)",
+                               placeholder=app.state.config.vimba.gain.auto_max,
+                               min=float(c["min"]), max=float(c["max"]), precision=1, step=0.1,
+                               validation={f"Required value between {c['min']}-{c['max']}":
+                                           lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                     .classes("flex-1")
+                     .bind_value(app.state.config_updates["vimba"]["gain"], "auto_max",
+                                 forward=lambda v: float(v) if v is not None else None))
+
+            # Fixed gain value (visible when auto is Off)
+            with (ui.column().classes("w-full")
+                  .bind_visibility_from(app.state.config_updates["vimba"]["gain"], "auto",
+                                        backward=lambda v: v == "Off")):
+                c = FIELD_CONSTRAINTS["vimba.gain.value"]
+                (ui.number(label="Gain (dB)",
+                           placeholder=app.state.config.vimba.gain.value,
+                           min=float(c["min"]), max=float(c["max"]), precision=1, step=0.1,
+                           validation={f"Required value between {c['min']}-{c['max']}":
+                                       lambda v, c=c: validate_number(v, c["min"], c["max"])})
+                 .classes("w-full")
+                 .bind_value(app.state.config_updates["vimba"]["gain"], "value",
+                             forward=lambda v: float(v) if v is not None else None))
+
+        grid_separator()
+        (ui.label("Auto Controller").classes("font-bold")
+         .tooltip("Auto-exposure/gain controller target intensity and behavior. "
+                  "Only active when exposure or gain auto mode is not 'Off'."))
+        with ui.column().classes("w-full gap-1"):
+            c = FIELD_CONSTRAINTS["vimba.auto.target"]
+            (ui.number(label="Target Intensity (%)",
+                       placeholder=app.state.config.vimba.auto.target,
+                       min=float(c["min"]), max=float(c["max"]), precision=1, step=1, suffix="%",
+                       validation={f"Required value between {c['min']}-{c['max']}":
+                                   lambda v, c=c: validate_number(v, c["min"], c["max"])})
+             .classes("w-full")
+             .tooltip("Target mean pixel brightness. Lower values preserve highlights in bright backgrounds; "
+                      "higher values improve visibility of dark subjects. Default 50.0.")
+             .bind_value(app.state.config_updates["vimba"]["auto"], "target",
+                         forward=lambda v: float(v) if v is not None else None))
+            (ui.select(["Minimizenoise", "Minimizeblur"], label="Precedence")
+             .classes("w-full")
+             .tooltip("'Minimizenoise': favors longer exposure + lower gain (better SNR). "
+                      "'Minimizeblur': favors shorter exposure + higher gain (freezes motion).")
+             .bind_value(app.state.config_updates["vimba"]["auto"], "precedence"))
+            c = FIELD_CONSTRAINTS["vimba.auto.rate"]
+            (ui.number(label="Controller Rate (iterations/s)",
+                       placeholder=app.state.config.vimba.auto.rate,
+                       min=float(c["min"]), max=float(c["max"]), precision=0, step=10,
+                       validation={f"Required value between {c['min']}-{c['max']}":
+                                   lambda v, c=c: validate_number(v, c["min"], c["max"])})
+             .classes("w-full")
+             .tooltip("Higher values adapt faster to changing light but may cause flickering.")
+             .bind_value(app.state.config_updates["vimba"]["auto"], "rate",
+                         forward=lambda v: int(v) if v is not None else None))
 
 def create_startup_settings() -> None:
     """Create UI elements and config binding for startup settings."""
