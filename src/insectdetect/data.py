@@ -7,39 +7,80 @@ Docs:     https://maxsitt.github.io/insect-detect-docs/
 
 Functions:
     save_encoded_frame(): Save MJPEG-encoded frame to .jpg file.
+    save_vimba_frame():   Save Vimba camera frame as lossless PNG + JSON metadata.
     archive_data(): Copy captured data + logs to archive directory and manage disk space.
     upload_data(): Upload archived data to cloud storage provider via rclone.
 """
 
+import cv2
+import json
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Literal
 
 import depthai as dai
+import numpy as np
 import psutil
 
 
 def save_encoded_frame(
     frame: dai.ImgFrame,
     session_path: Path,
+    timelapse_path: Path,
     file_stem: str,
     trigger: Literal["detection", "timelapse"] = "detection"
 ) -> None:
     """Save MJPEG-encoded frame to .jpg file.
 
     Args:
-        frame:        depthai.ImgFrame message (type: BITSTREAM).
-        session_path: Recording session directory where the frame is saved.
-        file_stem:    Filename stem (without extension) for the saved .jpg file.
-        trigger:      Capture trigger type ('detection' or 'timelapse').
+        frame:          depthai.ImgFrame message (type: BITSTREAM).
+        session_path:   Path to directory where detection-triggered frames are saved.
+        timelapse_path: Path to directory where timelapse-triggered frames are saved.
+        file_stem:      Filename stem (without extension) for the saved .jpg file.
+        trigger:        Capture trigger type ('detection' or 'timelapse').
     """
     if trigger == "timelapse":
-        img_path = session_path / "timelapse" / f"{file_stem}_timelapse.jpg"
+        img_path = timelapse_path / f"{file_stem}_timelapse.jpg"
     else:
         img_path = session_path / f"{file_stem}.jpg"
     with open(img_path, "wb", buffering=1024 * 1024) as jpg:
         frame.getData().tofile(jpg)
+
+
+def save_vimba_frame(
+    img: np.ndarray,
+    metadata: dict,
+    spectral_path: Path,
+    spectral_timelapse_path: Path,
+    file_stem: str,
+    trigger: Literal["detection", "timelapse"] = "detection",
+) -> None:
+    """Save Vimba camera frame as lossless PNG + JSON metadata.
+
+    Args:
+        img:                     Mono8 numpy array from Vimba camera.
+        metadata:                Dict of per-frame camera metadata to save alongside the frame.
+        spectral_path:           Path to the session 'spectral' directory.
+        spectral_timelapse_path: Path to the session 'spectral/timelapse' directory.
+        file_stem:               Filename stem (without extension) for the saved files.
+        trigger:                 Capture trigger type ('detection' or 'timelapse').
+    """
+    if trigger == "timelapse":
+        img_path = spectral_timelapse_path / f"{file_stem}_spectral_timelapse.png"
+        json_path = spectral_timelapse_path / f"{file_stem}_spectral_timelapse.json"
+    else:
+        img_path = spectral_path / f"{file_stem}_spectral.png"
+        json_path = spectral_path / f"{file_stem}_spectral.json"
+
+    cv2.imwrite(str(img_path), img)
+
+    serializable_metadata = {
+        k: str(v) if not isinstance(v, (int, float, bool, str, type(None))) else v
+        for k, v in metadata.items()
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(serializable_metadata, f, indent=2)
 
 
 def archive_data(data_path: Path, device_id: str, disk_low: int = 5000) -> Path:
@@ -124,6 +165,23 @@ def archive_data(data_path: Path, device_id: str, disk_low: int = 5000) -> Path:
                 subprocess.run([
                     "zip", "-q", "-r", "-u", "-0", timelapse_zip_path, ".", "-i", "*.jpg",
                 ], cwd=timelapse_dir, check=False)
+
+            # Pack spectral detection frames into zip
+            spectral_dir = timestamp_dir / "spectral"
+            if spectral_dir.is_dir() and next(spectral_dir.glob("*.png"), None):
+                spectral_zip_path = archive_timestamp_dir / f"{timestamp_dir.name}_spectral.zip"
+                subprocess.run([
+                    "zip", "-q", "-r", "-u", "-0", spectral_zip_path, ".", "-i", "*.png", "*.json",
+                    "-x", "timelapse/*"
+                ], cwd=spectral_dir, check=False)
+
+            # Pack spectral timelapse frames into zip
+            spectral_timelapse_dir = timestamp_dir / "spectral" / "timelapse"
+            if spectral_timelapse_dir.is_dir() and next(spectral_timelapse_dir.glob("*.png"), None):
+                spectral_timelapse_zip_path = archive_timestamp_dir / f"{timestamp_dir.name}_spectral_timelapse.zip"
+                subprocess.run([
+                    "zip", "-q", "-r", "-u", "-0", spectral_timelapse_zip_path, ".", "-i", "*.png", "*.json",
+                ], cwd=spectral_timelapse_dir, check=False)
 
             # Copy non-image files (metadata CSV, log, config JSON) directly
             for file_path in timestamp_dir.glob("*.*"):

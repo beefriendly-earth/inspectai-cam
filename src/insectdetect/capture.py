@@ -23,6 +23,7 @@ Stop Conditions:
     - Configured recording session duration exceeded.
     - Free disk space drops below threshold.
     - OAK chip temperature exceeds threshold.
+    - Vimba camera sensor temperature exceeds threshold.
     - Battery charge level drops below threshold more than twice.
     - External shutdown trigger (e.g. button press).
     - OAK pipeline stops unexpectedly.
@@ -42,18 +43,21 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 import depthai as dai
+import numpy as np
 import psutil
 from gpiozero import LED
 
+from vmbpy import *
+
 from insectdetect.config import AppConfig, load_config_selector, load_config_yaml, sanitize_config
 from insectdetect.constants import CONFIGS_PATH, DATA_PATH, HOSTNAME, LOGS_PATH
-from insectdetect.data import archive_data, save_encoded_frame, upload_data
+from insectdetect.data import archive_data, save_encoded_frame, save_vimba_frame, upload_data
 from insectdetect.metrics import configure_logger, save_metrics, save_session_info
 from insectdetect.oak import create_pipeline, deletterbox_bbox
 from insectdetect.postprocess import process_images
@@ -64,11 +68,38 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class _VimbaFrameBuffer:
+    """Thread-safe buffer holding the latest Vimba frame and metadata."""
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _img: np.ndarray | None = field(default=None, init=False, repr=False)
+    _metadata: dict = field(default_factory=dict, init=False, repr=False)
+
+    def put(self, img: np.ndarray, metadata: dict) -> None:
+        with self._lock:
+            self._img = img
+            self._metadata = metadata
+
+    def get(self) -> tuple[np.ndarray, dict] | None:
+        with self._lock:
+            if self._img is None:
+                return None
+            return self._img.copy(), dict(self._metadata)
+
+    def get_temperature(self) -> float | None:
+        """Return the latest DeviceTemperature value without copying the frame."""
+        with self._lock:
+            temp = self._metadata.get("DeviceTemperature")
+            return float(temp) if isinstance(temp, (int, float)) else None
+
+
+@dataclass
 class RecordingContext:
     """Context object holding all state and resources for a single recording session."""
     session_path: Path
     metadata_path: Path
     timelapse_path: Path
+    spectral_path: Path
+    spectral_timelapse_path: Path
     session_id: int
     session_dur: float
     pwr: PowerManagerState
@@ -91,9 +122,11 @@ class RecordingResult:
     disk_free: int = 0
     chargelevel: int | str | None = None
     temp_oak: int = 0
+    temp_vimba: float = 0.0
     stopped_by_shutdown: bool = False
     stopped_by_disk: bool = False
     stopped_by_temp: bool = False
+    stopped_by_temp_vimba: bool = False
     stopped_by_charge: bool = False
 
 
@@ -181,7 +214,7 @@ def _create_session_dir(
     data_path: Path,
     config_active: str,
     config: AppConfig
-) -> tuple[Path, Path, Path, int]:
+) -> tuple[Path, Path, Path, Path, Path, int]:
     """Create timestamped directory for this recording session and save config snapshot.
 
     The session ID is read from a persistent file and incremented on each run.
@@ -194,7 +227,8 @@ def _create_session_dir(
         config:        AppConfig containing all configuration settings.
 
     Returns:
-        Tuple of (session_path, metadata_path, timelapse_path, session_id).
+        Tuple of (session_path, metadata_path, timelapse_path, spectral_path,
+                  spectral_timelapse_path, session_id).
     """
     session_id_file = data_path / "last_session_id.txt"
     session_id = int(session_id_file.read_text(encoding="utf-8")) + 1 if session_id_file.exists() else 1
@@ -206,12 +240,16 @@ def _create_session_dir(
     metadata_path = session_path / f"{timestamp}_metadata.csv"
     timelapse_path = session_path / "timelapse"
     timelapse_path.mkdir(exist_ok=True)
+    spectral_path = session_path / "spectral"
+    spectral_path.mkdir(exist_ok=True)
+    spectral_timelapse_path = spectral_path / "timelapse"
+    spectral_timelapse_path.mkdir(exist_ok=True)
 
     config_snapshot_path = session_path / f"{timestamp}_{Path(config_active).stem}.json"
     json.dump(sanitize_config(config), config_snapshot_path.open("w", encoding="utf-8"), indent=2)
 
     logger.info("Recording session directory created: %s", session_path)
-    return session_path, metadata_path, timelapse_path, session_id
+    return session_path, metadata_path, timelapse_path, spectral_path, spectral_timelapse_path, session_id
 
 
 def _start_metrics_thread(
@@ -255,6 +293,174 @@ def _start_metrics_thread(
     return thread
 
 
+def _vimba_setup_camera(cam: "Camera", config: AppConfig, spectral_path: Path) -> None:
+    """Set up Vimba camera from AppConfig settings.
+
+    Args:
+        cam:    Active Vimba Camera instance.
+        config: AppConfig containing all configuration settings.
+        spectral_path: Path to the session 'spectral' directory for settings snapshot.
+    """
+    vc = config.vimba
+
+    # Enforce Mono8 regardless of previous camera state
+    try:
+        cam.set_pixel_format(PixelFormat.Mono8)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not set Mono8 pixel format")
+
+    # Frame rate
+    try:
+        cam.get_feature_by_name("AcquisitionFrameRateEnable").set(vc.fps_enable)
+        if vc.fps_enable:
+            try:
+                cam.get_feature_by_name("AcquisitionFrameRate").set(vc.fps)
+            except (AttributeError, VmbFeatureError):
+                logger.warning("Vimba: could not set AcquisitionFrameRate to %s fps", vc.fps)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not set AcquisitionFrameRateEnable")
+
+    # Exposure
+    try:
+        cam.get_feature_by_name("ExposureAuto").set(vc.exposure.auto)
+        if vc.exposure.auto != "Off":
+            cam.get_feature_by_name("ExposureAutoMin").set(vc.exposure.auto_min)
+            cam.get_feature_by_name("ExposureAutoMax").set(vc.exposure.auto_max)
+        else:
+            cam.get_feature_by_name("ExposureTime").set(vc.exposure.time)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure exposure settings")
+
+    # Gain
+    try:
+        cam.get_feature_by_name("GainAuto").set(vc.gain.auto)
+        if vc.gain.auto != "Off":
+            cam.get_feature_by_name("GainAutoMin").set(vc.gain.auto_min)
+            cam.get_feature_by_name("GainAutoMax").set(vc.gain.auto_max)
+        else:
+            cam.get_feature_by_name("Gain").set(vc.gain.value)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure gain settings")
+
+    # Auto-exposure/gain controller
+    try:
+        cam.get_feature_by_name("IntensityControllerTarget").set(vc.auto.target)
+        cam.get_feature_by_name("IntensityAutoPrecedence").set(vc.auto.precedence)
+        cam.get_feature_by_name("IntensityControllerRate").set(vc.auto.rate)
+    except (AttributeError, VmbFeatureError):
+        logger.warning("Vimba: could not configure auto intensity controller settings")
+
+    # Save full camera feature state as XML snapshot
+    try:
+        settings_path = spectral_path / "vimba_settings.xml"
+        cam.save_settings(str(settings_path), PersistType.All)
+        logger.debug("Vimba camera settings saved to %s", settings_path)
+    except Exception:
+        logger.warning("Vimba: could not save settings XML snapshot")
+
+
+def _read_vimba_metadata(cam: "Camera", frame: "Frame") -> dict:
+    """Read per-frame metadata from Vimba camera.
+
+    Args:
+        cam:   Active Vimba Camera instance.
+        frame: Captured Vimba Frame.
+
+    Returns:
+        Dict of per-frame metadata values.
+    """
+    metadata: dict = {
+        "capture_time": datetime.now().isoformat(),
+        "frame_id": frame.get_id(),
+        "frame_timestamp": frame.get_timestamp(),
+    }
+    for name in ("ExposureTime", "Gain", "DeviceTemperature"):
+        try:
+            metadata[name] = cam.get_feature_by_name(name).get()
+        except (AttributeError, VmbFeatureError):
+            pass
+    return metadata
+
+
+class _VimbaStreamHandler:
+    """Vimba frame callback that stores the latest complete frame in a buffer."""
+
+    def __init__(self, buffer: _VimbaFrameBuffer) -> None:
+        self._buffer = buffer
+        self.frame_count = 0
+
+    def __call__(self, cam: "Camera", stream: "Stream", frame: "Frame") -> None:
+        if frame.get_status() != FrameStatus.Complete:
+            cam.queue_frame(frame)
+            return
+        self.frame_count += 1
+        img = np.squeeze(frame.as_numpy_ndarray()).copy()
+        metadata = _read_vimba_metadata(cam, frame)
+        cam.queue_frame(frame)
+        self._buffer.put(img, metadata)
+
+
+def _vimba_camera_thread(
+    buffer: _VimbaFrameBuffer,
+    stop_event: threading.Event,
+    config: AppConfig,
+    spectral_path: Path
+) -> None:
+    """Run Vimba camera streaming in a background thread.
+
+    Args:
+        buffer:     Shared frame buffer to write captured frames into.
+        stop_event: Event that signals the thread to stop.
+        config:     AppConfig containing all configuration settings.
+        spectral_path: Path to the session 'spectral' directory for settings snapshot.
+    """
+    try:
+        with VmbSystem.get_instance() as vmb:
+            cams = vmb.get_all_cameras()
+            if not cams:
+                logger.warning("Vimba: no cameras found - spectral camera disabled")
+                return
+            with cams[0] as cam:
+                _vimba_setup_camera(cam, config, spectral_path)
+                handler = _VimbaStreamHandler(buffer)
+                cam.start_streaming(handler=handler, buffer_count=5)
+                logger.info("Vimba camera streaming started")
+                try:
+                    stop_event.wait()
+                finally:
+                    cam.stop_streaming()
+                    logger.info("Vimba camera streaming stopped")
+    except Exception:
+        logger.exception("Error in Vimba camera thread")
+
+
+def _start_vimba_thread(
+    buffer: _VimbaFrameBuffer,
+    stop_event: threading.Event,
+    config: AppConfig,
+    spectral_path: Path
+) -> threading.Thread:
+    """Start Vimba camera background thread.
+
+    Args:
+        buffer:     Shared frame buffer.
+        stop_event: Event to signal thread stop.
+        config:     AppConfig containing all configuration settings.
+        spectral_path: Path to the session 'spectral' directory for settings snapshot.
+
+    Returns:
+        Started non-daemon thread.
+    """
+    thread = threading.Thread(
+        target=_vimba_camera_thread,
+        args=(buffer, stop_event, config, spectral_path),
+        name="VimbaCamera",
+        daemon=False
+    )
+    thread.start()
+    return thread
+
+
 def _run_recording(
     ctx: RecordingContext,
     config: AppConfig,
@@ -276,9 +482,14 @@ def _run_recording(
     """
     result = RecordingResult()
 
+    # Initialize Vimba frame buffer and start camera thread
+    vimba_buffer = _VimbaFrameBuffer()
+    vimba_stop = threading.Event()
+    vimba_thread = _start_vimba_thread(vimba_buffer, vimba_stop, config, ctx.spectral_path)
+
     with (
         ctx.pipeline,
-        ThreadPoolExecutor(max_workers=1) as executor,
+        ThreadPoolExecutor(max_workers=2) as executor,
         open(ctx.metadata_path, "a", buffering=1, encoding="utf-8") as metadata_file
     ):
         # Start optional system metrics logging thread
@@ -345,6 +556,7 @@ def _run_recording(
         # Initialize variables for capture/check events at start of recording session
         det_interval = config.recording.interval.detection
         tl_interval = config.recording.interval.timelapse
+        vimba_interval = config.vimba.capture_interval
         ae_region = config.detection.ae_region.enabled
         ae_region_active = False
         last_ae_time: float = 0.0
@@ -352,18 +564,23 @@ def _run_recording(
         disk_check = config.storage.disk_check
         temp_oak_max = config.oak.temp_max
         temp_oak_check = config.oak.temp_check
+        temp_vimba_max = config.vimba.temp_max
+        temp_vimba_check = config.vimba.temp_check
         charge_min = config.powermanager.charge_min
         charge_check = config.powermanager.charge_check
         sysinfo = cast(dai.SystemInformation | None, ctx.q_syslog.tryGet())
         result.disk_free = disk_free
         result.temp_oak = round(sysinfo.chipTemperature.average) if sysinfo else 0
+        result.temp_vimba = vimba_buffer.get_temperature() or 0.0
         result.chargelevel = ctx.pwr.chargelevel_start if ctx.pwr.enabled else None
         result.session_start = datetime.now()
         start_time = time.monotonic()
         last_capture = start_time - tl_interval  # trigger first timelapse capture immediately
         next_capture = start_time + det_interval
+        last_vimba_capture = start_time - vimba_interval
         last_disk_check = start_time
         last_temp_oak_check = start_time
+        last_temp_vimba_check = start_time
         last_charge_check = start_time
         chargelevels: list[int | str | None] = []
 
@@ -375,6 +592,7 @@ def _run_recording(
                 and not ctx.pwr.external_shutdown.is_set()
                 and result.disk_free > disk_min
                 and result.temp_oak < temp_oak_max
+                and result.temp_vimba < temp_vimba_max
                 and len(chargelevels) < 3
             ):
                 # Determine whether to capture image based on current time and configured intervals
@@ -451,12 +669,12 @@ def _run_recording(
                                     # Set AE region to bbox of most recent active tracking ID (capped to 1 Hz)
                                     # Map bbox (frame-normalized) to sensor-space coordinates
                                     roi_x, roi_y, roi_w, roi_h = ctx.sensor_roi
-                                    # bbox_max is in post-rotation frame space (992x768, W×H)
-                                    # After 90° CW rotation:
-                                    # - frame x-axis maps to sensor ROI height axis (inverted)
-                                    # - frame y-axis maps to sensor ROI width axis
-                                    s_xmin = round(roi_x + bbox_max[1] * roi_w)
-                                    s_ymin = round(roi_y + (1.0 - bbox_max[2]) * roi_h)  # xmax -> ymin (inverted)
+                                    # Map bbox (frame-normalized) back to sensor-space coordinates.
+                                    # After 270° CW (= 90° CCW) rotation:
+                                    # - frame y-axis → sensor x-axis (inverted: 1 - fy)
+                                    # - frame x-axis → sensor y-axis (not inverted)
+                                    s_xmin = round(roi_x + (1.0 - bbox_max[3]) * roi_w)
+                                    s_ymin = round(roi_y + bbox_max[0] * roi_h)
                                     s_w = max(10, round((bbox_max[3] - bbox_max[1]) * roi_w))
                                     s_h = max(10, round((bbox_max[2] - bbox_max[0]) * roi_h))
                                     rect_bbox: tuple[int, int, int, int] = (
@@ -479,9 +697,29 @@ def _run_recording(
                     if track_active or timelapse_capture:
                         # Save MJPEG-encoded frame to .jpg in a separate thread
                         trigger = "detection" if track_active else "timelapse"
-                        executor.submit(save_encoded_frame, frame, ctx.session_path, file_stem, trigger)
+                        executor.submit(
+                            save_encoded_frame,
+                            frame, ctx.session_path, ctx.timelapse_path, file_stem, trigger
+                        )
                         last_capture = current_time
                         next_capture = current_time + det_interval
+
+                        # Save Vimba frame on timelapse trigger (always) or detection trigger
+                        save_vimba = timelapse_capture or (
+                            track_active
+                            and current_time >= last_vimba_capture + vimba_interval
+                        )
+                        if save_vimba:
+                            vimba_data = vimba_buffer.get()
+                            if vimba_data is not None:
+                                vimba_img, vimba_metadata = vimba_data
+                                executor.submit(
+                                    save_vimba_frame,
+                                    vimba_img, vimba_metadata,
+                                    ctx.spectral_path, ctx.spectral_timelapse_path,
+                                    file_stem, trigger
+                                )
+                            last_vimba_capture = current_time
 
                         # Update free disk space (MB) at configured interval
                         if current_time >= last_disk_check + disk_check:
@@ -497,6 +735,13 @@ def _run_recording(
                     sysinfo = cast(dai.SystemInformation | None, ctx.q_syslog.tryGet())
                     result.temp_oak = round(sysinfo.chipTemperature.average) if sysinfo else result.temp_oak
                     last_temp_oak_check = current_time
+
+                # Update Vimba sensor temperature at configured interval
+                if current_time >= last_temp_vimba_check + temp_vimba_check:
+                    temp_vimba = vimba_buffer.get_temperature()
+                    if temp_vimba is not None:
+                        result.temp_vimba = temp_vimba
+                    last_temp_vimba_check = current_time
 
                 # Update charge level at configured interval and add to list if below threshold
                 if ctx.pwr.enabled and current_time >= last_charge_check + charge_check:
@@ -517,6 +762,7 @@ def _run_recording(
             result.stopped_by_shutdown = ctx.pwr.external_shutdown.is_set()
             result.stopped_by_disk = result.disk_free < disk_min
             result.stopped_by_temp = result.temp_oak >= temp_oak_max
+            result.stopped_by_temp_vimba = result.temp_vimba >= temp_vimba_max
             result.stopped_by_charge = ctx.pwr.enabled and len(chargelevels) >= 3
             _log_recording_end(ctx, result)
 
@@ -538,9 +784,11 @@ def _run_recording(
                 ctx.pwr.chargelevel_start, result.chargelevel
             )
 
-            # Remove timelapse directory if no frames were saved
+            # Remove timelapse directories if no frames were saved
             if ctx.timelapse_path.exists() and not next(ctx.timelapse_path.iterdir(), None):
                 ctx.timelapse_path.rmdir()
+            if ctx.spectral_timelapse_path.exists() and not next(ctx.spectral_timelapse_path.iterdir(), None):
+                ctx.spectral_timelapse_path.rmdir()
 
             # Signal stop to image processing thread and wait for it to finish
             if processing_thread is not None:
@@ -548,6 +796,12 @@ def _run_recording(
                 processing_thread.join(timeout=120)
                 if processing_thread.is_alive():
                     logger.warning("Image processing thread did not finish within 2 minutes")
+
+            # Stop Vimba camera thread
+            vimba_stop.set()
+            vimba_thread.join(timeout=10)
+            if vimba_thread.is_alive():
+                logger.warning("Vimba camera thread did not finish within 10 seconds")
 
     return result
 
@@ -570,6 +824,9 @@ def _log_recording_end(ctx: RecordingContext, result: RecordingResult) -> None:
     elif result.stopped_by_temp:
         logger.warning("Recording session %s stopped early due to high OAK chip temperature: %s °C",
                        ctx.session_id, result.temp_oak)
+    elif result.stopped_by_temp_vimba:
+        logger.warning("Recording session %s stopped early due to high Vimba camera temperature: %s °C",
+                       ctx.session_id, result.temp_vimba)
     elif result.stopped_by_charge:
         logger.warning("Recording session %s stopped early due to low charge level: %s%%",
                        ctx.session_id, result.chargelevel)
@@ -673,7 +930,8 @@ def main() -> None:
     session_dur = _get_session_dur(config, pwr)
 
     # Create timestamped session directory and save sanitized config snapshot
-    session_path, metadata_path, timelapse_path, session_id = _create_session_dir(
+    (session_path, metadata_path, timelapse_path,
+     spectral_path, spectral_timelapse_path, session_id) = _create_session_dir(
         DATA_PATH, config_active, config
     )
 
@@ -686,6 +944,8 @@ def main() -> None:
         session_path=session_path,
         metadata_path=metadata_path,
         timelapse_path=timelapse_path,
+        spectral_path=spectral_path,
+        spectral_timelapse_path=spectral_timelapse_path,
         session_id=session_id,
         session_dur=session_dur,
         pwr=pwr,
