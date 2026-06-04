@@ -478,6 +478,31 @@ class UploadConfig(BaseModel):
     content: Literal["all", "full", "crops", "timelapse", "metadata"] = "crops"
 
 
+class UploadServerConfig(BaseModel):
+    """Upload captured frames and detection metadata to the Insector API if enabled.
+
+    Uploads happen in the background during recording via a thread-safe queue.
+    Any files not uploaded before shutdown are retried in the next session
+    using a per-session manifest file (uploaded.csv).
+
+    - base_url:          Base URL of the Insector API (e.g. 'https://api.example.com').
+    - api_key:           API key sent as 'X-API-Key' header with every request.
+    - timeout_s:         Per-request timeout in seconds.
+    - max_retries:       Maximum number of upload attempts before giving up until next session.
+    - retry_delay_s:     Seconds to wait between retry attempts.
+    - upload_timelapse:  If False (default), only detection-triggered frames and their
+                         spectral pairs are uploaded. Timelapse frames are stored locally
+                         only. Set to True to also upload timelapse-triggered frames.
+    """
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    timeout_s: float = Field(default=30.0, ge=1.0, le=300.0)
+    max_retries: int = Field(default=3, ge=1, le=10)
+    retry_delay_s: float = Field(default=5.0, ge=1.0, le=60.0)
+    upload_timelapse: bool = False
+
+
 class StorageConfig(BaseModel):
     """Local storage monitoring, archiving and upload settings.
 
@@ -488,6 +513,7 @@ class StorageConfig(BaseModel):
     disk_check: int = Field(default=60, ge=1, le=600)
     archive: ArchiveConfig = ArchiveConfig()
     upload: UploadConfig = UploadConfig()
+    upload_server: UploadServerConfig = UploadServerConfig()
 
 
 class HotspotSetupConfig(BaseModel):

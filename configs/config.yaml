@@ -99,6 +99,14 @@ storage:
   upload:
     enabled: false
     content: crops
+  upload_server:
+    enabled: false
+    base_url: ""
+    api_key: ""
+    timeout_s: 30.0
+    max_retries: 3
+    retry_delay_s: 5.0
+    upload_timelapse: false
 startup:
   hotspot_setup:
     enabled: true

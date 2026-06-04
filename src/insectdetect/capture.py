@@ -44,7 +44,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -58,6 +58,7 @@ from vmbpy import *
 from insectdetect.config import AppConfig, load_config_selector, load_config_yaml, sanitize_config
 from insectdetect.constants import CONFIGS_PATH, DATA_PATH, HOSTNAME, LOGS_PATH
 from insectdetect.data import archive_data, save_encoded_frame, save_vimba_frame, upload_data
+from insectdetect.upload import CaptureUploader, UploadConfig
 from insectdetect.metrics import configure_logger, save_metrics, save_session_info
 from insectdetect.oak import create_pipeline, deletterbox_bbox
 from insectdetect.postprocess import process_images
@@ -223,7 +224,7 @@ def _create_session_dir(
 
     Args:
         data_path:     Root data directory where session folders are created.
-        config_active: Filename of the active config (e.g. 'config.yaml').
+        config_active: Filename of the active config (e.g. 'config.yaml'.
         config:        AppConfig containing all configuration settings.
 
     Returns:
@@ -370,7 +371,7 @@ def _read_vimba_metadata(cam: "Camera", frame: "Frame") -> dict:
         Dict of per-frame metadata values.
     """
     metadata: dict = {
-        "capture_time": datetime.now().isoformat(),
+        "capture_time": datetime.now(timezone.utc).isoformat(),
         "frame_id": frame.get_id(),
         "frame_timestamp": frame.get_timestamp(),
     }
@@ -486,6 +487,17 @@ def _run_recording(
     vimba_buffer = _VimbaFrameBuffer()
     vimba_stop = threading.Event()
     vimba_thread = _start_vimba_thread(vimba_buffer, vimba_stop, config, ctx.spectral_path)
+
+    # Initialize uploader if enabled
+    uploader: CaptureUploader | None = None
+    if config.storage.upload_server.enabled:
+        upload_cfg = UploadConfig(
+            **config.storage.upload_server.model_dump(),
+            model_name=config.detection.model,
+        )
+        uploader = CaptureUploader(upload_cfg, ctx.session_path)
+        uploader.start()
+        uploader.enqueue_leftover_sessions(DATA_PATH)
 
     with (
         ctx.pipeline,
@@ -604,7 +616,9 @@ def _run_recording(
                 track = cast(dai.Tracklets | None, ctx.q_tracks.tryGet())
 
                 if frame is not None and (triggered_capture or timelapse_capture):
-                    timestamp = datetime.now()
+                    # UTC for API-visible timestamps; server's pre-validator accepts
+                    # ISO 8601 with offset and converts to float epoch.
+                    timestamp = datetime.now(timezone.utc)
                     timestamp_iso = timestamp.isoformat()
                     timestamp_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S-%f")
                     file_stem = f"{HOSTNAME}_{timestamp_str}"
@@ -695,12 +709,25 @@ def _run_recording(
                                 last_ae_time = 0.0
 
                     if track_active or timelapse_capture:
-                        # Save MJPEG-encoded frame to .jpg in a separate thread
                         trigger = "detection" if track_active else "timelapse"
-                        executor.submit(
+
+                        # Save MJPEG-encoded OAK frame; enqueue for upload once written
+                        oak_future = executor.submit(
                             save_encoded_frame,
                             frame, ctx.session_path, ctx.timelapse_path, file_stem, trigger
                         )
+                        if uploader is not None:
+                            # jpg_path mirrors the path chosen in save_encoded_frame()
+                            if trigger == "timelapse":
+                                jpg_path = ctx.timelapse_path / f"{file_stem}_timelapse.jpg"
+                            else:
+                                jpg_path = ctx.session_path / f"{file_stem}.jpg"
+                            # file_stem (no suffix) is the client_uuid — matches metadata CSV rows
+                            oak_future.add_done_callback(
+                                lambda _f, stem=file_stem, path=jpg_path:
+                                    uploader.enqueue_oak_jpeg(stem, path)  # type: ignore[union-attr]
+                            )
+
                         last_capture = current_time
                         next_capture = current_time + det_interval
 
@@ -713,12 +740,26 @@ def _run_recording(
                             vimba_data = vimba_buffer.get()
                             if vimba_data is not None:
                                 vimba_img, vimba_metadata = vimba_data
-                                executor.submit(
+                                # png/json paths mirror the paths chosen in save_vimba_frame()
+                                if trigger == "timelapse":
+                                    png_path = ctx.spectral_timelapse_path / f"{file_stem}_spectral_timelapse.png"
+                                    json_path = ctx.spectral_timelapse_path / f"{file_stem}_spectral_timelapse.json"
+                                else:
+                                    png_path = ctx.spectral_path / f"{file_stem}_spectral.png"
+                                    json_path = ctx.spectral_path / f"{file_stem}_spectral.json"
+
+                                vimba_future = executor.submit(
                                     save_vimba_frame,
                                     vimba_img, vimba_metadata,
                                     ctx.spectral_path, ctx.spectral_timelapse_path,
                                     file_stem, trigger
                                 )
+                                if uploader is not None:
+                                    # file_stem (no suffix) as identifier — correlates with OAK frame
+                                    vimba_future.add_done_callback(
+                                        lambda _f, stem=file_stem, p=png_path, j=json_path:
+                                            uploader.enqueue_spectral_pair(stem, p, j)  # type: ignore[union-attr]
+                                    )
                             last_vimba_capture = current_time
 
                         # Update free disk space (MB) at configured interval
