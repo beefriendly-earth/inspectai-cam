@@ -109,9 +109,9 @@ storage:
     upload_timelapse: false
 startup:
   hotspot_setup:
-    enabled: true
+    enabled: false
   network_setup:
-    enabled: true
+    enabled: false
   auto_run:
     enabled: false
     primary: capture
