@@ -44,7 +44,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -371,7 +371,7 @@ def _read_vimba_metadata(cam: "Camera", frame: "Frame") -> dict:
         Dict of per-frame metadata values.
     """
     metadata: dict = {
-        "capture_time": datetime.now().isoformat(),
+        "capture_time": datetime.now(timezone.utc).isoformat(),
         "frame_id": frame.get_id(),
         "frame_timestamp": frame.get_timestamp(),
     }
@@ -491,7 +491,10 @@ def _run_recording(
     # Initialize uploader if enabled
     uploader: CaptureUploader | None = None
     if config.storage.upload_server.enabled:
-        upload_cfg = UploadConfig(**config.storage.upload_server.model_dump())
+        upload_cfg = UploadConfig(
+            **config.storage.upload_server.model_dump(),
+            model_name=config.detection.model,
+        )
         uploader = CaptureUploader(upload_cfg, ctx.session_path)
         uploader.start()
         uploader.enqueue_leftover_sessions(DATA_PATH)
@@ -613,7 +616,9 @@ def _run_recording(
                 track = cast(dai.Tracklets | None, ctx.q_tracks.tryGet())
 
                 if frame is not None and (triggered_capture or timelapse_capture):
-                    timestamp = datetime.now()
+                    # UTC for API-visible timestamps; server's pre-validator accepts
+                    # ISO 8601 with offset and converts to float epoch.
+                    timestamp = datetime.now(timezone.utc)
                     timestamp_iso = timestamp.isoformat()
                     timestamp_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S-%f")
                     file_stem = f"{HOSTNAME}_{timestamp_str}"

@@ -128,20 +128,20 @@ class UploadConfig:
     upload_timelapse: bool = False
     # consumed by CaptureUploader.start() log message only; not forwarded to _InsectorClient
     enabled: bool = True
+    # Name of the active OAK detection model. Stamped onto each detection record
+    # so analysts can attribute predictions to a model version.
+    model_name: str = "insect_detect"
 
 
 @dataclass(frozen=True)
 class DetectionRecord:
-    """Detection metadata sent to POST /api/record before the image upload.
-
-    Field names must match the existing POST /api/record payload in api.py.
-    Verify against the actual server endpoint before deploying.
-    """
+    """Detection metadata sent to POST /api/record before the image upload."""
     client_uuid: str    # = bare file_stem, correlates record with image upload
-    timestamp: str      # ISO 8601 string
-    label: str          # detection label / classification name
-    confidence: float   # model confidence score [0.0, 1.0]
-    track_id: int
+    timestamp: str      # ISO 8601 string (server accepts ISO or float epoch)
+    label: str          # detection label, sent as classifications[0].name
+    confidence: float   # model confidence, sent as classifications[0].probability
+    track_id: int       # 0 = "no track"; omitted from payload in that case
+    model_name: str     # detection model identifier; sent as classifications[0].model_name
 
 
 class _InsectorClient:
@@ -163,19 +163,23 @@ class _InsectorClient:
         Args:
             record: Detection metadata. client_uuid must match the one used in
                     the subsequent upload_oak_image() call.
-
-        Note:
-            Field names (label, confidence, track_id) should be verified against
-            the server's CreateOrUpdateRecordRequest schema in api.py before deploying.
         """
         url = f"{self._base}/api/record"
-        payload = {
+        payload: dict[str, object] = {
             "client_uuid": record.client_uuid,
             "timestamp": record.timestamp,
-            "label": record.label,
-            "confidence": record.confidence,
-            "track_id": str(record.track_id),
+            "classifications": [
+                {
+                    "name": record.label,
+                    "probability": record.confidence,
+                    "model_name": record.model_name,
+                }
+            ],
         }
+        # track_id == 0 is the "no active track" sentinel; omit so the server
+        # stores NULL instead of confusing it with tracklet ID 0.
+        if record.track_id:
+            payload["track_id"] = str(record.track_id)
         with self._lock:
             resp = self._session.post(
                 url,
@@ -229,7 +233,8 @@ class _InsectorClient:
                     "image": (png_path.name, png_f, "image/png"),
                     "metadata": (json_path.name, json_f, "application/json"),
                 }
-                data = {"client_uuid": file_stem}
+                # Server contract uses `name` (basename for the pair), not `client_uuid`.
+                data = {"name": file_stem}
                 resp = self._session.post(
                     url, headers=self._auth(), files=files, data=data, timeout=self._timeout
                 )
@@ -474,7 +479,9 @@ class CaptureUploader:
                     kind="record",
                     identifier=file_stem,
                     session_dir=session_dir,
-                    detection_record=_row_to_detection_record(file_stem, row),
+                    detection_record=_row_to_detection_record(
+                        file_stem, row, self._cfg.model_name
+                    ),
                 ))
             if jpeg_key not in uploaded:
                 _maybe(_UploadItem(
@@ -674,22 +681,17 @@ def _load_metadata_rows(session_dir: Path) -> dict[str, dict[str, str]]:
     return rows
 
 
-def _row_to_detection_record(file_stem: str, row: dict[str, str] | None) -> DetectionRecord:
+def _row_to_detection_record(
+    file_stem: str, row: dict[str, str] | None, model_name: str
+) -> DetectionRecord:
     """Build a DetectionRecord from a metadata CSV row.
 
     Falls back to safe defaults if the row is missing or incomplete.
 
     Args:
-        file_stem: Bare file stem used as client_uuid.
-        row:       CSV row dict, or None if the metadata CSV was not found.
-
-    Returns:
-        DetectionRecord ready to send to POST /api/record.
-
-    Note:
-        Column names (timestamp, label, confidence, track_id) must match
-        the actual columns written by save_metadata() in data.py.
-        Verify before deploying.
+        file_stem:  Bare file stem used as client_uuid.
+        row:        CSV row dict, or None if the metadata CSV was not found.
+        model_name: Active detection model identifier from UploadConfig.
     """
     if row is None:
         return DetectionRecord(
@@ -698,6 +700,7 @@ def _row_to_detection_record(file_stem: str, row: dict[str, str] | None) -> Dete
             label="unknown",
             confidence=0.0,
             track_id=0,
+            model_name=model_name,
         )
     return DetectionRecord(
         client_uuid=file_stem,
@@ -705,4 +708,5 @@ def _row_to_detection_record(file_stem: str, row: dict[str, str] | None) -> Dete
         label=row.get("label", "unknown"),
         confidence=float(row.get("confidence") or 0.0),
         track_id=int(row.get("track_id") or 0),
+        model_name=model_name,
     )
