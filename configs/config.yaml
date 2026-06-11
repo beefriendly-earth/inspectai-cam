@@ -107,6 +107,7 @@ storage:
     max_retries: 3
     retry_delay_s: 5.0
     upload_timelapse: false
+    upload_spectral: true
 startup:
   hotspot_setup:
     enabled: false

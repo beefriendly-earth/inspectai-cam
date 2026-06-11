@@ -144,6 +144,7 @@ class UploadConfig:
     max_retries: int = 3
     retry_delay_s: float = 5.0
     upload_timelapse: bool = False
+    upload_spectral: bool = True
     enabled: bool = True
 
 
@@ -295,7 +296,10 @@ class CaptureUploader:
 
     def start(self) -> None:
         self._thread.start()
-        logger.info("CaptureUploader started (upload_timelapse=%s)", self._cfg.upload_timelapse)
+        logger.info(
+            "CaptureUploader started (upload_timelapse=%s, upload_spectral=%s)",
+            self._cfg.upload_timelapse, self._cfg.upload_spectral,
+        )
 
     def stop(self, wait: bool = True, timeout: float = 60.0) -> None:
         """Signal the upload thread to drain the remaining queue and exit."""
@@ -352,6 +356,8 @@ class CaptureUploader:
             is_timelapse: True if this pair was captured on a timelapse trigger.
         """
         if is_timelapse and not self._cfg.upload_timelapse:
+            return
+        if not self._cfg.upload_spectral:
             return
         self._enqueue(_UploadItem(
             kind="spectral_png",
@@ -474,20 +480,21 @@ class CaptureUploader:
                         session_path=sp,
                     ))
 
-        # Vimba spectral detection pairs
-        spectral_dir = session_dir / "spectral"
-        if spectral_dir.is_dir():
-            enqueued += self._enqueue_spectral_leftovers(
-                spectral_dir, session_dir, data_path, uploaded, suffix="_spectral", is_timelapse=False
-            )
-            # Vimba spectral timelapse pairs (skipped if upload_timelapse is disabled)
-            if self._cfg.upload_timelapse:
-                spectral_tl_dir = spectral_dir / "timelapse"
-                if spectral_tl_dir.is_dir():
-                    enqueued += self._enqueue_spectral_leftovers(
-                        spectral_tl_dir, session_dir, data_path, uploaded,
-                        suffix="_spectral_timelapse", is_timelapse=True
-                    )
+        # Vimba spectral detection pairs (skipped if upload_spectral is disabled)
+        if self._cfg.upload_spectral:
+            spectral_dir = session_dir / "spectral"
+            if spectral_dir.is_dir():
+                enqueued += self._enqueue_spectral_leftovers(
+                    spectral_dir, session_dir, data_path, uploaded, suffix="_spectral", is_timelapse=False
+                )
+                # Vimba spectral timelapse pairs (skipped if upload_timelapse is disabled)
+                if self._cfg.upload_timelapse:
+                    spectral_tl_dir = spectral_dir / "timelapse"
+                    if spectral_tl_dir.is_dir():
+                        enqueued += self._enqueue_spectral_leftovers(
+                            spectral_tl_dir, session_dir, data_path, uploaded,
+                            suffix="_spectral_timelapse", is_timelapse=True
+                        )
 
         return enqueued
 

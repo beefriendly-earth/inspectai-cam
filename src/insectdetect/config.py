@@ -493,6 +493,8 @@ class UploadServerConfig(BaseModel):
     - upload_timelapse:  If False (default), only detection-triggered frames and their
                          spectral pairs are uploaded. Timelapse frames are stored locally
                          only. Set to True to also upload timelapse-triggered frames.
+    - upload_spectral:   If False, Vimba spectral images are not uploaded. Only OAK frames
+                         and health reports are sent. Defaults to True.
     """
     enabled: bool = False
     base_url: str = ""
@@ -501,6 +503,7 @@ class UploadServerConfig(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=10)
     retry_delay_s: float = Field(default=5.0, ge=1.0, le=60.0)
     upload_timelapse: bool = False
+    upload_spectral: bool = True
 
 
 class StorageConfig(BaseModel):
