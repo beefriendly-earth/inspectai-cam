@@ -108,7 +108,8 @@ def save_metrics(
     device_id: str,
     session_id: int,
     q_syslog: dai.MessageQueue,
-    get_power_info: Callable[[], dict[str, object]] | None = None
+    get_power_info: Callable[[], dict[str, object]] | None = None,
+    rpi_metrics: dict[str, object] | None = None,
 ) -> None:
     """Write system metrics to .csv file during a recording session.
 
@@ -118,10 +119,11 @@ def save_metrics(
         session_id:     Incrementing recording session counter.
         q_syslog:       depthai output queue for SystemInformation messages.
         get_power_info: Optional callable returning a dict of power metrics for logging.
+        rpi_metrics:    Pre-fetched RPi metrics dict, or None to fetch fresh.
     """
     try:
         timestamp = datetime.now().isoformat()
-        rpi_info = get_rpi_metrics()
+        rpi_info = rpi_metrics if rpi_metrics is not None else get_rpi_metrics()
         oak_info = get_oak_metrics(q_syslog)
 
         logs: dict[str, object] = {

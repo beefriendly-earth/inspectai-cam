@@ -1,19 +1,18 @@
-"""Background uploader for captured frames and metadata to the Insector API.
+"""Background uploader for captured frames to the Insector API.
 
 OAK camera data uploaded:
-  - Detection frames (if enabled):
-      1. POST /api/record              — create detection record (client_uuid, timestamp,
-                                         label, confidence, track_id)
-      2. POST /api/record/upload-image — attach JPEG to that record
-  - Timelapse frames (if upload_timelapse=True):
-      POST /api/record/upload-image    — image only, no prior record needed
+  - Detection frames:  POST /api/full-frame/upload  (name, image/jpeg, session_path)
+  - Timelapse frames:  POST /api/full-frame/upload  (only if upload_timelapse=True)
 
 Vimba (spectral) camera data uploaded:
-  - Detection PNG + JSON pair   → POST /api/spectral/upload  (per pair, client_uuid = file_stem)
+  - Detection PNG + JSON pair   → POST /api/spectral/upload  (name, session_path)
   - Timelapse PNG + JSON pair   → POST /api/spectral/upload  (only if upload_timelapse=True)
 
+No server-side DB records are created for this device. Both endpoints are file-only;
+POST /api/record and POST /api/record/upload-image are not used.
+
 Uses an in-memory queue so captures are never blocked by network I/O.
-A per-session upload manifest (uploaded.csv) tracks successfully uploaded files/records.
+A per-session upload manifest (uploaded.csv) tracks successfully uploaded files.
 On the next session start, call enqueue_leftover_sessions() to re-enqueue any
 files from previous sessions that are absent from their manifest.
 Files that fail permanently after max_retries remain on disk and will be retried
@@ -30,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import psutil
 import requests
 
 logger = logging.getLogger(__name__)
@@ -43,14 +43,6 @@ _MANIFEST_COLUMNS = ("path", "kind")
 # ---------------------------------------------------------------------------
 
 def _load_manifest(session_dir: Path) -> set[str]:
-    """Return the set of relative paths already recorded in the upload manifest.
-
-    Args:
-        session_dir: Session directory containing the manifest file.
-
-    Returns:
-        Set of path strings relative to session_dir, or empty set if none exists.
-    """
     manifest_path = session_dir / _MANIFEST_FILENAME
     if not manifest_path.exists():
         return set()
@@ -69,13 +61,7 @@ def _append_manifest(session_dir: Path, relative_path: str, kind: str) -> None:
     """Append one successfully uploaded entry to the session manifest.
 
     Creates the manifest with a header row if it does not yet exist.
-    Uses line buffering (buffering=1) so each row is flushed immediately —
-    the manifest stays consistent even if the process is killed mid-session.
-
-    Args:
-        session_dir:   Session directory where the manifest is written.
-        relative_path: File path relative to session_dir (used as stable key).
-        kind:          Upload kind string.
+    Uses line buffering (buffering=1) so each row is flushed immediately.
     """
     manifest_path = session_dir / _MANIFEST_FILENAME
     write_header = not manifest_path.exists()
@@ -87,6 +73,28 @@ def _append_manifest(session_dir: Path, relative_path: str, kind: str) -> None:
             writer.writerow({"path": relative_path, "kind": kind})
     except Exception as exc:
         logger.warning("Could not write upload manifest %s: %s", manifest_path, exc)
+
+
+# ---------------------------------------------------------------------------
+# Session path helper
+# ---------------------------------------------------------------------------
+
+def session_path_for(file_path: Path, data_path: Path, content_subdir: str = "") -> str:
+    """Return the device-relative path to send as session_path to the upload server.
+
+    Strips the content-type subdirectory (e.g. 'spectral') so the server organizes
+    files by date/session without repeating the implied content subdir.
+
+    Examples:
+        session_dir/<stem>.jpg                      → '2026-06-09/2026-06-09_18-23-45'
+        session_dir/timelapse/<stem>_timelapse.jpg  → '2026-06-09/2026-06-09_18-23-45/timelapse'
+        session_dir/spectral/<stem>_spectral.png    → '2026-06-09/2026-06-09_18-23-45'
+    """
+    rel = file_path.parent.relative_to(data_path)
+    parts = list(rel.parts)
+    if content_subdir and content_subdir in parts:
+        parts.remove(content_subdir)
+    return "/".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +113,19 @@ def _raise_for_status(resp: requests.Response) -> None:
     msg = "Request failed"
     try:
         j = resp.json()
-        msg = j.get("error") or j.get("message") or msg
+        # FastAPI/Pydantic validation errors come back as {"detail": [...]}.
+        detail = j.get("detail") or j.get("error") or j.get("message")
+        if isinstance(detail, list):
+            msg = "; ".join(
+                f"{'.'.join(str(x) for x in e.get('loc', []))}: {e.get('msg', '')}"
+                for e in detail
+            )
+        elif detail:
+            msg = str(detail)
+        else:
+            msg = str(j)
     except Exception:
-        pass
+        msg = resp.text[:200] if resp.text else "Request failed"
     raise InsectorUploadError(resp.status_code, msg)
 
 
@@ -126,22 +144,7 @@ class UploadConfig:
     max_retries: int = 3
     retry_delay_s: float = 5.0
     upload_timelapse: bool = False
-    # consumed by CaptureUploader.start() log message only; not forwarded to _InsectorClient
     enabled: bool = True
-    # Name of the active OAK detection model. Stamped onto each detection record
-    # so analysts can attribute predictions to a model version.
-    model_name: str = "insect_detect"
-
-
-@dataclass(frozen=True)
-class DetectionRecord:
-    """Detection metadata sent to POST /api/record before the image upload."""
-    client_uuid: str    # = bare file_stem, correlates record with image upload
-    timestamp: str      # ISO 8601 string (server accepts ISO or float epoch)
-    label: str          # detection label, sent as classifications[0].name
-    confidence: float   # model confidence, sent as classifications[0].probability
-    track_id: int       # 0 = "no track"; omitted from payload in that case
-    model_name: str     # detection model identifier; sent as classifications[0].model_name
 
 
 class _InsectorClient:
@@ -157,29 +160,61 @@ class _InsectorClient:
     def _auth(self) -> dict[str, str]:
         return {"X-API-Key": self._key}
 
-    def create_record(self, record: DetectionRecord) -> None:
-        """POST /api/record — must be called before upload_oak_image() for detection frames.
+    def upload_full_frame(self, file_stem: str, jpg_path: Path, session_path: str = "") -> bool:
+        """POST /api/full-frame/upload — upload an OAK RGB JPEG.
 
-        Args:
-            record: Detection metadata. client_uuid must match the one used in
-                    the subsequent upload_oak_image() call.
+        Returns True on success, False if storage is not configured (HTTP 501).
         """
-        url = f"{self._base}/api/record"
-        payload: dict[str, object] = {
-            "client_uuid": record.client_uuid,
-            "timestamp": record.timestamp,
-            "classifications": [
-                {
-                    "name": record.label,
-                    "probability": record.confidence,
-                    "model_name": record.model_name,
-                }
-            ],
-        }
-        # track_id == 0 is the "no active track" sentinel; omit so the server
-        # stores NULL instead of confusing it with tracklet ID 0.
-        if record.track_id:
-            payload["track_id"] = str(record.track_id)
+        url = f"{self._base}/api/full-frame/upload"
+        with self._lock:
+            with jpg_path.open("rb") as f:
+                data: dict[str, str] = {"name": file_stem}
+                if session_path:
+                    data["session_path"] = session_path
+                resp = self._session.post(
+                    url,
+                    headers=self._auth(),
+                    files={"image": (jpg_path.name, f, "image/jpeg")},
+                    data=data,
+                    timeout=self._timeout,
+                )
+        if resp.status_code == 501:
+            return False
+        _raise_for_status(resp)
+        return True
+
+    def upload_spectral_pair(
+        self, file_stem: str, png_path: Path, json_path: Path, session_path: str = ""
+    ) -> bool:
+        """POST /api/spectral/upload — upload a Vimba PNG + JSON sidecar pair.
+
+        Returns True on success, False if storage is not configured (HTTP 501).
+        """
+        url = f"{self._base}/api/spectral/upload"
+        with self._lock:
+            with png_path.open("rb") as png_f, json_path.open("rb") as json_f:
+                data: dict[str, str] = {"name": file_stem}
+                if session_path:
+                    data["session_path"] = session_path
+                resp = self._session.post(
+                    url,
+                    headers=self._auth(),
+                    files={
+                        "image": (png_path.name, png_f, "image/png"),
+                        "metadata": (json_path.name, json_f, "application/json"),
+                    },
+                    data=data,
+                    timeout=self._timeout,
+                )
+        if resp.status_code == 501:
+            return False
+        _raise_for_status(resp)
+        return True
+
+    def submit_health_report(self, report: dict[str, object]) -> None:
+        """POST /api/health — None values are stripped before sending."""
+        url = f"{self._base}/api/health"
+        payload = {k: v for k, v in report.items() if v is not None}
         with self._lock:
             resp = self._session.post(
                 url,
@@ -189,102 +224,34 @@ class _InsectorClient:
             )
         _raise_for_status(resp)
 
-    def upload_oak_image(self, file_stem: str, jpg_path: Path) -> bool:
-        """POST /api/record/upload-image
-
-        For detection frames, create_record() must be called first.
-        For timelapse frames, no prior record is needed.
-
-        Args:
-            file_stem: Bare filename stem used as client_uuid.
-            jpg_path:  Path to the JPEG file to upload.
-
-        Returns:
-            True on success, False if storage is not configured (HTTP 501).
-        """
-        url = f"{self._base}/api/record/upload-image"
-        with self._lock:
-            with jpg_path.open("rb") as f:
-                files = {"image": (jpg_path.name, f, "image/jpeg")}
-                data = {"client_uuid": file_stem}
-                resp = self._session.post(
-                    url, headers=self._auth(), files=files, data=data, timeout=self._timeout
-                )
-        if resp.status_code == 501:
-            return False
-        _raise_for_status(resp)
-        return True
-
-    def upload_spectral_pair(self, file_stem: str, png_path: Path, json_path: Path) -> bool:
-        """POST /api/spectral/upload
-
-        Args:
-            file_stem: Bare filename stem used as client_uuid.
-            png_path:  Path to the PNG file.
-            json_path: Path to the matching JSON sidecar file.
-
-        Returns:
-            True on success, False if storage is not configured (HTTP 501).
-        """
-        url = f"{self._base}/api/spectral/upload"
-        with self._lock:
-            with png_path.open("rb") as png_f, json_path.open("rb") as json_f:
-                files = {
-                    "image": (png_path.name, png_f, "image/png"),
-                    "metadata": (json_path.name, json_f, "application/json"),
-                }
-                # Server contract uses `name` (basename for the pair), not `client_uuid`.
-                data = {"name": file_stem}
-                resp = self._session.post(
-                    url, headers=self._auth(), files=files, data=data, timeout=self._timeout
-                )
-        if resp.status_code == 501:
-            return False
-        _raise_for_status(resp)
-        return True
-
 
 # ---------------------------------------------------------------------------
 # Queue item
 # ---------------------------------------------------------------------------
 
-# record       — POST /api/record: create detection record before image upload
-# jpeg         — POST /api/record/upload-image: OAK JPEG (detection or timelapse)
+# full_frame   — POST /api/full-frame/upload: OAK JPEG (detection or timelapse)
 # spectral_png — POST /api/spectral/upload: Vimba PNG + JSON sidecar pair
-FileKind = Literal["record", "jpeg", "spectral_png"]
+FileKind = Literal["full_frame", "spectral_png"]
 
 
 @dataclass
 class _UploadItem:
     kind: FileKind
-    identifier: str     # client_uuid for jpeg/spectral_png/record
-    session_dir: Path   # used to write manifest entry and compute relative_path
-    # Primary file path (JPEG or PNG); None for 'record' items
-    primary_path: Path | None = None
-    # Spectral PNG uploads also carry the matching JSON sidecar
-    sidecar_path: Path | None = None
-    # Detection metadata payload for 'record' items
-    detection_record: DetectionRecord | None = None
+    identifier: str       # file_stem sent as `name` in the upload request
+    session_dir: Path     # used to write manifest entry and compute relative_path
+    primary_path: Path    # JPEG (full_frame) or PNG (spectral_png)
+    session_path: str     # device-relative path sent to server for organization
+    sidecar_path: Path | None = None  # JSON sidecar for spectral_png uploads
     retries: int = 0
     retry_after: float = field(default_factory=time.monotonic)
 
     @property
     def manifest_key(self) -> str:
-        """Stable string used as the manifest key.
-
-        File-backed items use their path relative to session_dir.
-        Record items (no file) use a synthetic key so they are also tracked.
-        """
-        if self.primary_path is not None:
-            return str(self.primary_path.relative_to(self.session_dir))
-        return f"record:{self.identifier}"
+        return str(self.primary_path.relative_to(self.session_dir))
 
     @property
     def log_name(self) -> str:
-        """Short name for log messages."""
-        if self.primary_path is not None:
-            return self.primary_path.name
-        return self.manifest_key
+        return self.primary_path.name
 
 
 # ---------------------------------------------------------------------------
@@ -294,13 +261,9 @@ class _UploadItem:
 class CaptureUploader:
     """Background uploader that drains a thread-safe in-memory queue of captured files.
 
-    Detection frames require two sequential queue items per frame:
-      1. kind='record' — POST /api/record (creates the server-side record)
-      2. kind='jpeg'   — POST /api/record/upload-image (attaches the image)
-    enqueue_oak_detection() always enqueues them in this order.
-
-    Timelapse frames (enqueue_oak_timelapse) and spectral pairs (enqueue_spectral_pair)
-    are only enqueued when UploadConfig.upload_timelapse is True.
+    OAK RGB frames go to POST /api/full-frame/upload.
+    Vimba spectral pairs go to POST /api/spectral/upload.
+    No server-side DB records are created for this device.
 
     Usage::
 
@@ -308,14 +271,11 @@ class CaptureUploader:
         uploader.start()
         uploader.enqueue_leftover_sessions(data_path)
 
-        # After save_encoded_frame() completes for a detection frame:
-        uploader.enqueue_oak_detection(record, jpg_path)
+        # After save_encoded_frame() completes:
+        uploader.enqueue_oak_jpeg(jpg_path, session_path)
 
-        # After save_encoded_frame() completes for a timelapse frame (only if enabled):
-        uploader.enqueue_oak_timelapse(file_stem, jpg_path)
-
-        # After save_vimba_frame() completes (only if enabled):
-        uploader.enqueue_spectral_pair(file_stem, png_path, json_path)
+        # After save_vimba_frame() completes:
+        uploader.enqueue_spectral_pair(file_stem, png_path, json_path, session_path)
 
         uploader.stop(wait=True)
     """
@@ -350,47 +310,26 @@ class CaptureUploader:
                     remaining,
                 )
 
-    def enqueue_oak_detection(self, record: DetectionRecord, jpg_path: Path) -> None:
-        """Enqueue a detection record + JPEG pair for upload.
+    def enqueue_oak_jpeg(
+        self, jpg_path: Path, session_path: str, is_timelapse: bool = False
+    ) -> None:
+        """Enqueue an OAK JPEG for upload to POST /api/full-frame/upload.
 
-        Enqueues the record item first so the server-side record is created
-        before the image upload is attempted. Both items share the same
-        client_uuid (record.client_uuid = jpg_path bare stem).
-
-        Args:
-            record:   Detection metadata. record.client_uuid must be the bare
-                      file_stem (no extension, no suffix).
-            jpg_path: Absolute path to the saved detection JPEG.
-        """
-        self._enqueue(_UploadItem(
-            kind="record",
-            identifier=record.client_uuid,
-            session_dir=self._session_dir,
-            detection_record=record,
-        ))
-        self._enqueue(_UploadItem(
-            kind="jpeg",
-            identifier=record.client_uuid,
-            session_dir=self._session_dir,
-            primary_path=jpg_path,
-        ))
-
-    def enqueue_oak_timelapse(self, file_stem: str, jpg_path: Path) -> None:
-        """Enqueue an OAK timelapse JPEG for upload (only if upload_timelapse is enabled).
-
-        Timelapse frames have no detection record — only the image is uploaded.
+        Timelapse frames are silently skipped unless upload_timelapse is enabled.
 
         Args:
-            file_stem: Bare filename stem without _timelapse suffix. Used as client_uuid.
-            jpg_path:  Absolute path to the saved timelapse JPEG.
+            jpg_path:     Absolute path to the saved JPEG file.
+            session_path: Device-relative session path for server-side organization.
+            is_timelapse: True if this is a timelapse frame.
         """
-        if not self._cfg.upload_timelapse:
+        if is_timelapse and not self._cfg.upload_timelapse:
             return
         self._enqueue(_UploadItem(
-            kind="jpeg",
-            identifier=file_stem,
+            kind="full_frame",
+            identifier=jpg_path.stem,
             session_dir=self._session_dir,
             primary_path=jpg_path,
+            session_path=session_path,
         ))
 
     def enqueue_spectral_pair(
@@ -398,6 +337,7 @@ class CaptureUploader:
         file_stem: str,
         png_path: Path,
         json_path: Path,
+        session_path: str,
         is_timelapse: bool = False,
     ) -> None:
         """Enqueue a Vimba spectral PNG + JSON sidecar pair for upload.
@@ -408,6 +348,7 @@ class CaptureUploader:
             file_stem:    Bare filename stem without _spectral/_spectral_timelapse suffix.
             png_path:     Absolute path to the saved PNG file.
             json_path:    Absolute path to the matching JSON sidecar file.
+            session_path: Device-relative session path for server-side organization.
             is_timelapse: True if this pair was captured on a timelapse trigger.
         """
         if is_timelapse and not self._cfg.upload_timelapse:
@@ -418,12 +359,54 @@ class CaptureUploader:
             session_dir=self._session_dir,
             primary_path=png_path,
             sidecar_path=json_path,
+            session_path=session_path,
         ))
 
     def pending(self) -> int:
         """Return the number of items still in the upload queue."""
         with self._queue_lock:
             return len(self._queue)
+
+    def send_health_report(
+        self,
+        session_start: float,
+        rpi_metrics: dict[str, object] | None,
+        power_info: dict[str, object] | None,
+    ) -> None:
+        """Build and POST a health report to /api/health.
+
+        Best-effort — failures are logged at DEBUG level and never affect the capture loop.
+
+        Args:
+            session_start: Unix timestamp (time.time()) of when the session started.
+            rpi_metrics:   Dict returned by get_rpi_metrics(), or None.
+            power_info:    Dict returned by pwr.get_power_info(), or None.
+        """
+        try:
+            disk = psutil.disk_usage("/")
+            report: dict[str, object] = {
+                "timestamp": time.time(),
+                "minutes_recorded": round((time.time() - session_start) / 60, 1),
+                "records_waiting_upload": self.pending(),
+                "disk": {
+                    "total_gb":     round(disk.total / 1_073_741_824, 2),
+                    "used_gb":      round(disk.used  / 1_073_741_824, 2),
+                    "free_gb":      round(disk.free  / 1_073_741_824, 2),
+                    "percent_used": disk.percent,
+                },
+            }
+            if rpi_metrics:
+                report["temperature"] = rpi_metrics.get("rpi_cpu_temp")
+            if power_info:
+                charge = power_info.get("charge_level")
+                if charge == "USB_C_IN":
+                    report["battery_level"] = 100.0
+                elif isinstance(charge, (int, float)):
+                    report["battery_level"] = float(charge)
+            self._client.submit_health_report(report)
+            logger.debug("Health report sent")
+        except Exception as exc:
+            logger.debug("Health report failed (non-critical): %s", exc)
 
     # ------------------------------------------------------------------
     # Leftover scanning
@@ -450,15 +433,14 @@ class CaptureUploader:
                     continue
                 if session_dir.resolve() == self._session_dir.resolve():
                     continue
-                total += self._enqueue_session_leftovers(session_dir)
+                total += self._enqueue_session_leftovers(session_dir, data_path)
 
         if total:
             logger.info("CaptureUploader: enqueued %d leftover item(s) from previous sessions", total)
         return total
 
-    def _enqueue_session_leftovers(self, session_dir: Path) -> int:
+    def _enqueue_session_leftovers(self, session_dir: Path, data_path: Path) -> int:
         uploaded = _load_manifest(session_dir)
-        stem_to_row = _load_metadata_rows(session_dir)
         enqueued = 0
 
         def _maybe(item: _UploadItem) -> None:
@@ -467,55 +449,43 @@ class CaptureUploader:
                 self._enqueue(item)
                 enqueued += 1
 
-        # OAK detection JPEGs + records
+        # OAK detection JPEGs
         for jpg_path in session_dir.glob("*.jpg"):
-            file_stem = jpg_path.stem
-            record_key = f"record:{file_stem}"
-            jpeg_key = str(jpg_path.relative_to(session_dir))
-
-            if record_key not in uploaded:
-                row = stem_to_row.get(file_stem)
-                _maybe(_UploadItem(
-                    kind="record",
-                    identifier=file_stem,
-                    session_dir=session_dir,
-                    detection_record=_row_to_detection_record(
-                        file_stem, row, self._cfg.model_name
-                    ),
-                ))
-            if jpeg_key not in uploaded:
-                _maybe(_UploadItem(
-                    kind="jpeg",
-                    identifier=file_stem,
-                    session_dir=session_dir,
-                    primary_path=jpg_path,
-                ))
+            sp = session_path_for(jpg_path, data_path)
+            _maybe(_UploadItem(
+                kind="full_frame",
+                identifier=jpg_path.stem,
+                session_dir=session_dir,
+                primary_path=jpg_path,
+                session_path=sp,
+            ))
 
         # OAK timelapse JPEGs (skipped if upload_timelapse is disabled)
         if self._cfg.upload_timelapse:
             timelapse_dir = session_dir / "timelapse"
             if timelapse_dir.is_dir():
                 for jpg_path in timelapse_dir.glob("*.jpg"):
-                    file_stem = jpg_path.stem.removesuffix("_timelapse")
+                    sp = session_path_for(jpg_path, data_path)
                     _maybe(_UploadItem(
-                        kind="jpeg",
-                        identifier=file_stem,
+                        kind="full_frame",
+                        identifier=jpg_path.stem,
                         session_dir=session_dir,
                         primary_path=jpg_path,
+                        session_path=sp,
                     ))
 
         # Vimba spectral detection pairs
         spectral_dir = session_dir / "spectral"
         if spectral_dir.is_dir():
             enqueued += self._enqueue_spectral_leftovers(
-                spectral_dir, session_dir, uploaded, suffix="_spectral", is_timelapse=False
+                spectral_dir, session_dir, data_path, uploaded, suffix="_spectral", is_timelapse=False
             )
             # Vimba spectral timelapse pairs (skipped if upload_timelapse is disabled)
             if self._cfg.upload_timelapse:
                 spectral_tl_dir = spectral_dir / "timelapse"
                 if spectral_tl_dir.is_dir():
                     enqueued += self._enqueue_spectral_leftovers(
-                        spectral_tl_dir, session_dir, uploaded,
+                        spectral_tl_dir, session_dir, data_path, uploaded,
                         suffix="_spectral_timelapse", is_timelapse=True
                     )
 
@@ -525,6 +495,7 @@ class CaptureUploader:
         self,
         directory: Path,
         session_dir: Path,
+        data_path: Path,
         uploaded: set[str],
         suffix: str,
         is_timelapse: bool,
@@ -542,12 +513,14 @@ class CaptureUploader:
                 )
                 continue
             file_stem = png_path.stem.removesuffix(suffix)
+            sp = session_path_for(png_path, data_path, content_subdir="spectral")
             self._enqueue(_UploadItem(
                 kind="spectral_png",
                 identifier=file_stem,
                 session_dir=session_dir,
                 primary_path=png_path,
                 sidecar_path=json_path,
+                session_path=sp,
             ))
             enqueued += 1
         return enqueued
@@ -575,13 +548,28 @@ class CaptureUploader:
 
     def _run(self) -> None:
         logger.debug("CaptureUploader thread running")
-        while not self._stop.is_set() or self.pending() > 0:
+        while not self._stop.is_set():
             item = self._pop_ready()
             if item is None:
                 time.sleep(0.2)
                 continue
             self._process(item)
-        logger.debug("CaptureUploader thread finished")
+        # Drain remaining ready items once (best-effort flush before exit)
+        drained = 0
+        deadline = time.monotonic() + 20.0  # hard cap on drain time
+        while time.monotonic() < deadline:
+            item = self._pop_ready()
+            if item is None:
+                break
+            self._process(item)
+            drained += 1
+        remaining = self.pending()
+        if remaining:
+            logger.warning(
+                "CaptureUploader exiting with %d item(s) still pending — will retry next session",
+                remaining,
+            )
+        logger.info("CaptureUploader thread finished (drained %d item(s))", drained)
 
     def _process(self, item: _UploadItem) -> None:
         try:
@@ -618,19 +606,14 @@ class CaptureUploader:
         self._requeue(item)
 
     def _dispatch(self, item: _UploadItem) -> bool:
-        if item.kind == "record":
-            if item.detection_record is None:
-                logger.error("Record item missing detection_record: %s", item.identifier)
-                return True
-            self._client.create_record(item.detection_record)
-            return True
-
-        if item.primary_path is None or not item.primary_path.exists():
+        if not item.primary_path.exists():
             logger.warning("Upload skipped — file no longer exists: %s", item.primary_path)
             return True
 
-        if item.kind == "jpeg":
-            return self._client.upload_oak_image(item.identifier, item.primary_path)
+        if item.kind == "full_frame":
+            return self._client.upload_full_frame(
+                item.identifier, item.primary_path, item.session_path
+            )
 
         if item.kind == "spectral_png":
             if item.sidecar_path is None or not item.sidecar_path.exists():
@@ -639,74 +622,8 @@ class CaptureUploader:
                 )
                 return True
             return self._client.upload_spectral_pair(
-                item.identifier, item.primary_path, item.sidecar_path
+                item.identifier, item.primary_path, item.sidecar_path, item.session_path
             )
 
         logger.error("Unknown upload kind: %s", item.kind)
         return True
-
-
-# ---------------------------------------------------------------------------
-# Helpers for leftover scanning
-# ---------------------------------------------------------------------------
-
-def _load_metadata_rows(session_dir: Path) -> dict[str, dict[str, str]]:
-    """Load the session metadata CSV into a dict keyed by bare file_stem.
-
-    The CSV 'filename' column contains e.g. 'hostname_2026-05-31_....jpg'.
-    Stripping the extension gives the bare file_stem used as client_uuid.
-
-    Args:
-        session_dir: Session directory containing the *_metadata.csv file.
-
-    Returns:
-        Dict mapping bare file_stem → CSV row dict, or empty dict on any error.
-
-    Note:
-        Column names (filename, timestamp, label, confidence, track_id) must
-        match the actual columns written by save_metadata() in data.py.
-        Verify before deploying.
-    """
-    rows: dict[str, dict[str, str]] = {}
-    for csv_path in session_dir.glob("*_metadata.csv"):
-        try:
-            with csv_path.open(newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    filename = row.get("filename", "")
-                    stem = Path(filename).stem if filename else ""
-                    if stem:
-                        rows[stem] = row
-        except Exception as exc:
-            logger.warning("Could not read metadata CSV %s: %s", csv_path, exc)
-    return rows
-
-
-def _row_to_detection_record(
-    file_stem: str, row: dict[str, str] | None, model_name: str
-) -> DetectionRecord:
-    """Build a DetectionRecord from a metadata CSV row.
-
-    Falls back to safe defaults if the row is missing or incomplete.
-
-    Args:
-        file_stem:  Bare file stem used as client_uuid.
-        row:        CSV row dict, or None if the metadata CSV was not found.
-        model_name: Active detection model identifier from UploadConfig.
-    """
-    if row is None:
-        return DetectionRecord(
-            client_uuid=file_stem,
-            timestamp="",
-            label="unknown",
-            confidence=0.0,
-            track_id=0,
-            model_name=model_name,
-        )
-    return DetectionRecord(
-        client_uuid=file_stem,
-        timestamp=row.get("timestamp", ""),
-        label=row.get("label", "unknown"),
-        confidence=float(row.get("confidence") or 0.0),
-        track_id=int(row.get("track_id") or 0),
-        model_name=model_name,
-    )

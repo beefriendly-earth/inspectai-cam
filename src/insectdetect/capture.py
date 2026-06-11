@@ -58,8 +58,8 @@ from vmbpy import *
 from insectdetect.config import AppConfig, load_config_selector, load_config_yaml, sanitize_config
 from insectdetect.constants import CONFIGS_PATH, DATA_PATH, HOSTNAME, LOGS_PATH
 from insectdetect.data import archive_data, save_encoded_frame, save_vimba_frame, upload_data
-from insectdetect.upload import CaptureUploader, UploadConfig
-from insectdetect.metrics import configure_logger, save_metrics, save_session_info
+from insectdetect.upload import CaptureUploader, UploadConfig, session_path_for
+from insectdetect.metrics import configure_logger, get_rpi_metrics, save_metrics, save_session_info
 from insectdetect.oak import create_pipeline, deletterbox_bbox
 from insectdetect.postprocess import process_images
 from insectdetect.power import PowerManagerState, init_power_manager
@@ -261,7 +261,9 @@ def _start_metrics_thread(
     device_id: str,
     session_id: int,
     q_syslog: dai.MessageQueue,
-    get_power_info: Callable[[], dict[str, object]] | None
+    get_power_info: Callable[[], dict[str, object]] | None,
+    uploader: "CaptureUploader | None" = None,
+    session_start: float | None = None,
 ) -> threading.Thread:
     """Start a background thread that saves system metrics at a fixed interval.
 
@@ -269,6 +271,10 @@ def _start_metrics_thread(
     save_metrics() repeatedly at the configured interval until stop_event is set.
     Uses stop_event.wait() instead of time.sleep() so the thread wakes up
     immediately when stop_event is set, avoiding shutdown delays.
+
+    If uploader and session_start are provided, also sends a health report to
+    POST /api/health after each metrics save. Health reporting is best-effort —
+    failures are logged at DEBUG level and never affect the capture loop.
 
     Args:
         stop_event:     Event that signals the thread to stop.
@@ -279,6 +285,8 @@ def _start_metrics_thread(
         session_id:     Incrementing recording session counter.
         q_syslog:       depthai output queue for SystemInformation messages.
         get_power_info: Optional callable returning a dict of power metrics.
+        uploader:       CaptureUploader instance for health reporting, or None.
+        session_start:  Unix timestamp of session start for minutes_recorded field.
 
     Returns:
         Started daemon thread running the metrics saving loop.
@@ -286,7 +294,15 @@ def _start_metrics_thread(
     def _metrics_loop() -> None:
         stop_event.wait(timeout=initial_delay)
         while not stop_event.is_set():
-            save_metrics(session_path, device_id, session_id, q_syslog, get_power_info)
+            rpi_metrics = get_rpi_metrics()
+            power_info = get_power_info() if get_power_info is not None else None
+            save_metrics(
+                session_path, device_id, session_id, q_syslog,
+                get_power_info=get_power_info,
+                rpi_metrics=rpi_metrics,
+            )
+            if uploader is not None and session_start is not None:
+                uploader.send_health_report(session_start, rpi_metrics, power_info)
             stop_event.wait(timeout=interval)
 
     thread = threading.Thread(target=_metrics_loop, name="MetricsLogger", daemon=True)
@@ -491,10 +507,7 @@ def _run_recording(
     # Initialize uploader if enabled
     uploader: CaptureUploader | None = None
     if config.storage.upload_server.enabled:
-        upload_cfg = UploadConfig(
-            **config.storage.upload_server.model_dump(),
-            model_name=config.detection.model,
-        )
+        upload_cfg = UploadConfig(**config.storage.upload_server.model_dump())
         uploader = CaptureUploader(upload_cfg, ctx.session_path)
         uploader.start()
         uploader.enqueue_leftover_sessions(DATA_PATH)
@@ -516,7 +529,9 @@ def _run_recording(
                 device_id=HOSTNAME,
                 session_id=ctx.session_id,
                 q_syslog=ctx.q_syslog,
-                get_power_info=ctx.pwr.get_power_info
+                get_power_info=ctx.pwr.get_power_info,
+                uploader=uploader,
+                session_start=time.time(),
             )
 
         # Start optional image post-processing thread
@@ -722,10 +737,10 @@ def _run_recording(
                                 jpg_path = ctx.timelapse_path / f"{file_stem}_timelapse.jpg"
                             else:
                                 jpg_path = ctx.session_path / f"{file_stem}.jpg"
-                            # file_stem (no suffix) is the client_uuid — matches metadata CSV rows
+                            sp = session_path_for(jpg_path, DATA_PATH)
                             oak_future.add_done_callback(
-                                lambda _f, stem=file_stem, path=jpg_path:
-                                    uploader.enqueue_oak_jpeg(stem, path)  # type: ignore[union-attr]
+                                lambda _f, path=jpg_path, s=sp, tl=(trigger == "timelapse"):
+                                    uploader.enqueue_oak_jpeg(path, s, is_timelapse=tl)  # type: ignore[union-attr]
                             )
 
                         last_capture = current_time
@@ -755,10 +770,10 @@ def _run_recording(
                                     file_stem, trigger
                                 )
                                 if uploader is not None:
-                                    # file_stem (no suffix) as identifier — correlates with OAK frame
+                                    spec_sp = session_path_for(png_path, DATA_PATH, content_subdir="spectral")
                                     vimba_future.add_done_callback(
-                                        lambda _f, stem=file_stem, p=png_path, j=json_path:
-                                            uploader.enqueue_spectral_pair(stem, p, j)  # type: ignore[union-attr]
+                                        lambda _f, stem=file_stem, p=png_path, j=json_path, s=spec_sp, tl=(trigger == "timelapse"):
+                                            uploader.enqueue_spectral_pair(stem, p, j, s, is_timelapse=tl)  # type: ignore[union-attr]
                                     )
                             last_vimba_capture = current_time
 
@@ -810,6 +825,10 @@ def _run_recording(
         except Exception:
             logger.exception("Error during recording session %s", ctx.session_id)
         finally:
+            # Stop uploader and wait for queue to drain
+            if uploader is not None:
+                uploader.stop(wait=True, timeout=30)
+
             # Stop background metrics logger and wait for thread to finish
             metrics_stop.set()
             if metrics_thread is not None:
