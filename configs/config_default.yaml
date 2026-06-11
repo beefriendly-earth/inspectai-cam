@@ -103,7 +103,7 @@ storage:
     enabled: true
     base_url: ""
     api_key: ""
-    timeout_s: 600.0
+    timeout_s: 180.0
     max_retries: 3
     retry_delay_s: 5.0
     upload_timelapse: false
