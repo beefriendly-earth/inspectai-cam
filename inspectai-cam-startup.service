@@ -12,6 +12,7 @@ Group=pi
 WorkingDirectory=/home/pi/inspectai-cam
 ExecStart=/home/pi/.local/bin/uv run startup
 Environment=HOME=/home/pi
+Environment=GENICAM_GENTL64_PATH=/home/pi/VimbaX_2026-1/cti
 RemainAfterExit=yes
 TimeoutStartSec=600
 TimeoutStopSec=30
