@@ -19,10 +19,15 @@ Startup sequence (optional steps configured in active config file):
 """
 
 import logging
+import socket
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from gpiozero import LED
 
 from insectdetect.config import (AppConfig, load_config_selector, load_config_yaml,
@@ -76,6 +81,77 @@ def _start_led(config: AppConfig) -> LED | None:
             time.sleep(0.1)
     logger.warning("Could not initialize LED on GPIO pin %s", config.led.gpio_pin)
     return None
+
+
+def _wait_for_dns(host: str, max_attempts: int = 30, check_interval: float = 1.0) -> bool:
+    """Wait until DNS resolution for a specific host works."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            logger.info("DNS for '%s' is ready after %s seconds", host, (attempt - 1) * check_interval)
+            return True
+        except socket.gaierror:
+            if attempt < max_attempts:
+                logger.debug("Waiting for DNS for '%s'... (%s/%s)", host, attempt, max_attempts)
+                time.sleep(check_interval)
+
+    logger.warning("DNS for '%s' not ready after %s seconds", host, (max_attempts - 1) * check_interval)
+    return False
+
+
+def _sync_server_config(config: AppConfig, config_active_path: Path) -> AppConfig:
+    """Fetch app_config overrides from the server and deep-merge into the local config.
+
+    Requires storage.upload_server to be enabled and configured with base_url and api_key.
+    Falls back to the existing local config on any error so the device always boots.
+    storage.upload_server.api_key is never overwritten (stripped before applying).
+    """
+    upload = config.storage.upload_server
+    if not (upload.enabled and upload.base_url and upload.api_key):
+        logger.info("Server config sync skipped (upload_server not configured)")
+        return config
+
+    host = urlparse(upload.base_url).hostname
+    if not host:
+        logger.warning("Server config sync skipped (invalid upload_server.base_url: %s)", upload.base_url)
+        return config
+
+    # LTE often comes up before DNS is usable
+    if not _wait_for_dns(host, max_attempts=30, check_interval=1.0):
+        logger.warning("Server config sync skipped (DNS not ready for %s)", host)
+        return config
+
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=2,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+
+    try:
+        resp = session.get(
+            upload.base_url.rstrip("/") + "/insectors/config",
+            headers={"X-API-Key": upload.api_key},
+            timeout=upload.timeout_s,
+        )
+        resp.raise_for_status()
+        app_config_overrides = resp.json().get("app_config")
+        if not app_config_overrides:
+            logger.info("No app_config key in server response, skipping sync")
+            return config
+        # Prevent the server from overwriting the device's own API key
+        app_config_overrides.get("storage", {}).get("upload_server", {}).pop("api_key", None)
+        config = update_config_yaml(config_active_path, app_config_overrides)
+        logger.info("Config synced from server and persisted")
+    except requests.RequestException as e:
+        logger.warning("Error syncing config from server, using local config: %s", e)
+
+    return config
 
 
 def _setup_hotspot(config: AppConfig, config_active_path: Path) -> AppConfig:
@@ -253,6 +329,27 @@ def _run_fallback(
         )
 
 
+def _wait_for_network(max_attempts: int = 30, check_interval: float = 1.0) -> bool:
+    """Wait for general network connectivity (DNS + routing)."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # DNS check (must be a hostname, not an IP)
+            socket.getaddrinfo("google.com", 443, type=socket.SOCK_STREAM)
+            # Routing check
+            with socket.create_connection(("1.1.1.1", 53), timeout=2):
+                pass
+            logger.info("Network connectivity confirmed after %s seconds", (attempt - 1) * check_interval)
+            return True
+        except OSError:
+            if attempt < max_attempts:
+                logger.debug("Waiting for network connectivity... (%s/%s)", attempt, max_attempts)
+                time.sleep(check_interval)
+
+    logger.warning("Network connectivity not available after %s seconds, proceeding anyway",
+                   (max_attempts - 1) * check_interval)
+    return False
+
+
 def main() -> None:
     """Run configured startup sequence."""
     # Create directory for storing logs and set paths for marker files
@@ -263,12 +360,18 @@ def main() -> None:
     configure_logger(Path(__file__).stem)
     logger.info("-------- Startup Logger initialized --------")
 
+    # Wait for LTE/network connectivity before proceeding
+    _wait_for_network()
+
     # Parse active configuration file
     config_selector = load_config_selector()
     config_active = config_selector.config_active
     config_active_path = BASE_PATH / "configs" / config_active
     config = load_config_yaml(config_active_path)
     logger.info("Configuration '%s' loaded successfully", config_active)
+
+    # Sync config overrides from server (server always wins where app_config is set)
+    config = _sync_server_config(config, config_active_path)
 
     # Fast-blink LED to indicate startup sequence is running
     led = _start_led(config)
