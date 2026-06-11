@@ -154,8 +154,9 @@ class _InsectorClient:
         self._base = cfg.base_url.rstrip("/")
         self._key = cfg.api_key
         self._timeout = cfg.timeout_s
-        self._session = requests.Session()
-        self._lock = threading.RLock()
+        self._upload_session = requests.Session()
+        self._health_session = requests.Session()
+        self._upload_lock = threading.Lock()
 
     def _auth(self) -> dict[str, str]:
         return {"X-API-Key": self._key}
@@ -166,12 +167,12 @@ class _InsectorClient:
         Returns True on success, False if storage is not configured (HTTP 501).
         """
         url = f"{self._base}/api/full-frame/upload"
-        with self._lock:
+        with self._upload_lock:
             with jpg_path.open("rb") as f:
                 data: dict[str, str] = {"name": file_stem}
                 if session_path:
                     data["session_path"] = session_path
-                resp = self._session.post(
+                resp = self._upload_session.post(
                     url,
                     headers=self._auth(),
                     files={"image": (jpg_path.name, f, "image/jpeg")},
@@ -191,12 +192,12 @@ class _InsectorClient:
         Returns True on success, False if storage is not configured (HTTP 501).
         """
         url = f"{self._base}/api/spectral/upload"
-        with self._lock:
+        with self._upload_lock:
             with png_path.open("rb") as png_f, json_path.open("rb") as json_f:
                 data: dict[str, str] = {"name": file_stem}
                 if session_path:
                     data["session_path"] = session_path
-                resp = self._session.post(
+                resp = self._upload_session.post(
                     url,
                     headers=self._auth(),
                     files={
@@ -215,13 +216,12 @@ class _InsectorClient:
         """POST /api/health — None values are stripped before sending."""
         url = f"{self._base}/api/health"
         payload = {k: v for k, v in report.items() if v is not None}
-        with self._lock:
-            resp = self._session.post(
-                url,
-                headers={**self._auth(), "Content-Type": "application/json"},
-                json=payload,
-                timeout=self._timeout,
-            )
+        resp = self._health_session.post(
+            url,
+            headers={**self._auth(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=15.0,
+        )
         _raise_for_status(resp)
 
 
@@ -556,7 +556,7 @@ class CaptureUploader:
             self._process(item)
         # Drain remaining ready items once (best-effort flush before exit)
         drained = 0
-        deadline = time.monotonic() + 20.0  # hard cap on drain time
+        deadline = time.monotonic() + 10.0  # hard cap on drain time
         while time.monotonic() < deadline:
             item = self._pop_ready()
             if item is None:

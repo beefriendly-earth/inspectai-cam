@@ -827,7 +827,7 @@ def _run_recording(
         finally:
             # Stop uploader and wait for queue to drain
             if uploader is not None:
-                uploader.stop(wait=True, timeout=30)
+                uploader.stop(wait=True, timeout=15)
 
             # Stop background metrics logger and wait for thread to finish
             metrics_stop.set()
