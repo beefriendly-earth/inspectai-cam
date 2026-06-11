@@ -497,7 +497,7 @@ class UploadServerConfig(BaseModel):
     enabled: bool = False
     base_url: str = ""
     api_key: str = ""
-    timeout_s: float = Field(default=30.0, ge=1.0, le=300.0)
+    timeout_s: float = Field(default=30.0, ge=1.0, le=600.0)
     max_retries: int = Field(default=3, ge=1, le=10)
     retry_delay_s: float = Field(default=5.0, ge=1.0, le=60.0)
     upload_timelapse: bool = False
